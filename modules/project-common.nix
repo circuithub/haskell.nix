@@ -11,7 +11,7 @@ with lib.types;
       description = "Optional name for better error messages";
     };
     src = mkOption {
-      type = either path package;
+      type = unspecified;
     };
     crossPlatforms = mkOption {
       type = unspecified;

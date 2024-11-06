@@ -6,8 +6,6 @@ let
   inherit (haskellLib.types) listOfFilteringNulls;
   inherit (lib) types;
 
-  path = types.path // { check = x: types.path.check (x.origSrc or x); };
-
   componentType = types.submodule [
     ./component.nix
     { _module.args = { inherit haskellLib; }; }
@@ -221,7 +219,7 @@ in
     };
 
     src = lib.mkOption {
-      type = types.nullOr (types.either path types.package);
+      type = types.unspecified;
       default =
         if options.package.identifier.name.isDefined && options.package.identifier.version.isDefined && options.sha256.isDefined
           then
@@ -269,7 +267,7 @@ in
     };
 
     patches = lib.mkOption {
-      type = types.listOf (types.either types.unspecified path);
+      type = types.listOf (types.unspecified);
       default = [ ];
     };
 
