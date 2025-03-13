@@ -73,7 +73,7 @@ pkgs:
     "iw"                                 = [ pkgs."wirelesstools" ];
     "jack"                               = [ pkgs."libjack2" ];
     "javascriptcoregtk-3.0"              = [ pkgs."webkitgtk24x-gtk3" ]; # These are the old APIs, of which 2.4 is the last provider, so map directly to that.
-    "javascriptcoregtk-4.0"              = [ pkgs."webkitgtk" ];
+    "javascriptcoregtk-4.0"              = [ pkgs."webkitgtk_4_0" ];
     "jpeg"                               = [ pkgs."libjpeg" ];
     "jvm"                                = [ pkgs."jdk" ];
     "lapack"                             = [ pkgs."liblapack" ];
@@ -151,9 +151,9 @@ pkgs:
     "wayland-cursor"                     = [ pkgs."wayland" ];
     "wayland-egl"                        = [ pkgs."libGL" ];
     "wayland-server"                     = [ pkgs."wayland" ];
-    "webkit2gtk"                         = [ pkgs."webkitgtk" ];
-    "webkit2gtk-4.0"                     = [ pkgs."webkitgtk" ];
-    "webkit2gtk-web-extension-4.0"       = [ pkgs."webkitgtk" ];
+    "webkit2gtk"                         = [ pkgs."webkitgtk_4_0" ];
+    "webkit2gtk-4.0"                     = [ pkgs."webkitgtk_4_0" ];
+    "webkit2gtk-web-extension-4.0"       = [ pkgs."webkitgtk_4_0" ];
     "webkitgtk-3.0"                      = [ pkgs."webkitgtk24x-gtk3" ]; # These are the old APIs, of which 2.4 is the last provider, so map directly to that
     "vulkan"                             = [ pkgs."vulkan-loader" ]; # vulkan-loader provides vulkan.pc file for pkg-config.
     "X11"                                = [ pkgs.xorg."libX11" ];
