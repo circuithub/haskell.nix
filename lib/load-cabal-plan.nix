@@ -75,7 +75,7 @@ let
           buildable = true;
         } // lookupDependencies hsPkgs.pkgsBuildBuild (components.setup.depends or []) (components.setup.exe-depends or []);
       };
-  nixFilesDir = callProjectResults.projectNix + callProjectResults.src.origSubDir or "";
+  nixFilesDir = "${builtins.unsafeDiscardStringContext callProjectResults.projectNix.outPath}${callProjectResults.src.origSubDir or ""}";
 in {
   # This replaces the `plan-nix/default.nix`
   pkgs = (hackage: {
@@ -95,14 +95,14 @@ in {
               let
                 # Read the output of `Cabal2Nix.hs`.  We need it for information not
                 # in the `plan.json` file.
-                cabal2nix = (
+                cabal2nix = builtins.trace (builtins.getContext nixFilesDir) ((
                   if builtins.pathExists (nixFilesDir + "/cabal-files/${p.pkg-name}.nix")
                     then import (nixFilesDir + "/cabal-files/${p.pkg-name}.nix")
                   else if builtins.pathExists (nixFilesDir + "/.plan.nix/${p.pkg-name}.nix")
                     then import (nixFilesDir + "/.plan.nix/${p.pkg-name}.nix")
                   else
                     # TODO make this an error?
-                    __trace "WARNING no `.nix` file for ${p.pkg-name} in ${nixFilesDir}." {}) (args // { hsPkgs = {}; });
+                    __trace "WARNING no `.nix` file for ${p.pkg-name} in ${nixFilesDir}." {}) (args // { hsPkgs = {}; }));
               in pkgs.lib.optionalAttrs (p ? pkg-src-sha256) {
                 sha256 = p.pkg-src-sha256;
               } // pkgs.lib.optionalAttrs (p.pkg-src.type or "" == "source-repo") {
