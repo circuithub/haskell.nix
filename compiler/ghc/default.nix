@@ -70,13 +70,13 @@ let self =
     # do not use ld.gold 2.3 with musl due to a ld.gold bug.
     # See: <https://sourceware.org/bugzilla/show_bug.cgi?id=22266>.
     # Note that this bug was resolved in 2017.
-    ( stdenv.targetPlatform.isLinux
+    false && ( stdenv.targetPlatform.isLinux
       # don't use gold on android.
       && !stdenv.targetPlatform.isAndroid
       # don't use gold with with musl. Still seems to be
       # affected by 22266.
       && !stdenv.targetPlatform.isMusl)
-, useLdLld ? false
+, useLdLld ? true
 , ghc-version ? src-spec.version
 , ghc-version-date ? null
 , ghc-commit-id ? null
