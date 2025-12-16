@@ -1,4 +1,4 @@
-{ lib, stdenv, mkShell, glibcLocales, ghcForComponent, makeConfigFiles, hsPkgs, hoogleLocal, haskellLib, pkgsBuildBuild, evalPackages, compiler, haskell-nix, ghc }:
+{ lib, stdenv, mkShell, glibcLocales, ghcForComponent, makeConfigFiles, hsPkgs, hoogleLocal, haskellLib, pkgsBuildBuild, evalPackages, compiler, haskell-nix, ghc, llvmPackages }:
 
 { # `packages` function selects packages that will be worked on in the shell itself.
   # These packages will not be built by `shellFor`, but their
@@ -143,6 +143,7 @@ let
     '';
     inherit enableDWARF;
     plugins = [];
+    ghcOptions =  haskell-nix.templateHaskell.${compiler.nix-name}.ghcOptions or [];
   };
 
   hoogleIndex = let
@@ -175,6 +176,7 @@ in
       ++ nativeBuildInputs
       ++ mkDrvArgs.nativeBuildInputs or []
       ++ lib.attrValues (pkgsBuildBuild.haskell-nix.tools' evalPackages compiler.nix-name tools)
+      ++ lib.optional (ghcEnv.baseGhc.useLdLld or false) llvmPackages.bintools
       # If this shell is a cross compilation shell include
       # wrapper script for running cabal build with appropriate args.
       # Includes `--with-compiler` in case the `cabal.project` file has `with-compiler:` in it.
@@ -192,10 +194,15 @@ in
                 ''} $(builtin type -P "${ghcEnv.targetPrefix}pkg-config" &> /dev/null && echo "--with-pkg-config=${ghcEnv.targetPrefix}pkg-config") \
                 "$@"
               '');
+    propagatedBuildInputs = mkDrvArgs.propagateBuildInputs or [] ++ ghcEnv.drv.propagatedBuildInputs;
     phases = ["installPhase"];
     installPhase = ''
       echo "${"Shell for " + toString (builtins.map (p : p.identifier.name) selectedPackages)}"
       echo $nativeBuildInputs $buildInputs > $out
+    '';
+    shellHook = mkDrvArgs.shellHook or "" + lib.optionalString stdenv.hostPlatform.isWindows ''
+
+       export pkgsHostTargetAsString="''${pkgsHostTarget[@]}"
     '';
 
     # This helps tools like `ghcide` (that use the ghc api) to find

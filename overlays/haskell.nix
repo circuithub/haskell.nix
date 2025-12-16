@@ -55,7 +55,7 @@ final: prev: {
         # Utility functions for working with the component builder.
         haskellLib = let hl = import ../lib {
             pkgs = final;
-            inherit (final) stdenv lib recurseIntoAttrs srcOnly;
+            inherit (final) stdenv lib srcOnly;
             haskellLib = hl;
         }; in hl;
 
@@ -696,9 +696,10 @@ final: prev: {
                             then config.ghc
                           else
                             final.lib.mkDefault selectedCompiler;
-                        in if ghc.isHaskellNixCompiler or false then ghc.override { hadrianEvalPackages = evalPackages; } else ghc;
+                        in if ghc.isHaskellNixCompiler or false then ghc.override { ghcEvalPackages = evalPackages; } else ghc;
                       compiler.nix-name = final.lib.mkForce config.compiler-nix-name;
                       evalPackages = final.lib.mkDefault evalPackages;
+                      inherit (config) prebuilt-depends;
                     } ];
                   extra-hackages = config.extra-hackages or [] ++ callProjectResults.extra-hackages;
                 };
@@ -947,7 +948,7 @@ final: prev: {
                   modules = [ { _module.args.buildModules = final.lib.mkForce buildProject.pkg-set; }
                       (mkCacheModule cache) ]
                     ++ (config.modules or [])
-                    ++ final.lib.optional (config.ghc != null) { ghc.package = config.ghc.override { hadrianEvalPackages = evalPackages; }; }
+                    ++ final.lib.optional (config.ghc != null) { ghc.package = config.ghc.override { ghcEvalPackages = evalPackages; }; }
                     ++ final.lib.optional (config.compiler-nix-name != null)
                         { compiler.nix-name = final.lib.mkForce config.compiler-nix-name; }
                     ++ [ { evalPackages = final.lib.mkDefault evalPackages; } ];
@@ -1034,7 +1035,7 @@ final: prev: {
         #   project = cabalProject' {...};
         # In your tests module add something that is effectively
         #   testProjectPlan = withInputs project.plan-nix;
-        withInputs = final.recurseIntoAttrs;
+        withInputs = final.lib.recurseIntoAttrs;
 
         iserv-proxy-exes = __mapAttrs (compiler-nix-name: _ghc:
             let
@@ -1151,9 +1152,9 @@ final: prev: {
 
         roots' = { compiler-nix-name, evalPackages ? final.pkgsBuildBuild }: ifdLevel:
           let
-            ghc = final.buildPackages.haskell-nix.compiler.${compiler-nix-name}.override { hadrianEvalPackages = evalPackages; };
+            ghc = final.buildPackages.haskell-nix.compiler.${compiler-nix-name}.override { ghcEvalPackages = evalPackages; };
           in
-            final.recurseIntoAttrs ({
+            final.lib.recurseIntoAttrs ({
             # Things that require no IFD to build
             source-pin-hackage = hackageSrc;
             source-pin-stackage = stackageSrc;
@@ -1178,7 +1179,8 @@ final: prev: {
             # GHCJS builds its own template haskell runner.
             # These seem to be the only things we use from `ghc-extra-packages`
             # in haskell.nix itself.
-            && !final.stdenv.hostPlatform.isGhcjs)
+            && !final.stdenv.hostPlatform.isGhcjs
+            && !final.stdenv.hostPlatform.isWasm)
               final.haskell-nix.iserv-proxy-exes.${compiler-nix-name});
     };
 }

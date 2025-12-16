@@ -1,4 +1,4 @@
-{ stdenv, lib, cabal-install, cabalProject', stackProject', recurseIntoAttrs, runCommand, testSrc, compiler-nix-name, evalPackages, buildPackages }:
+{ stdenv, lib, cabal-install, cabalProject', stackProject', runCommand, testSrc, compiler-nix-name, evalPackages, buildPackages }:
 
 with lib;
 
@@ -23,12 +23,15 @@ let
 
   exeExt = stdenv.hostPlatform.extensions.executable;
   crossSuffix = lib.optionalString (stdenv.hostPlatform != stdenv.buildPlatform) "-${stdenv.hostPlatform.config}";
+  crossSuffix' = lib.optionalString (stdenv.hostPlatform != stdenv.buildPlatform && stdenv.hostPlatform.isStatic) "-static" + crossSuffix;
 
-in recurseIntoAttrs ({
-  # Does not work on ghcjs because it needs zlib.
-  meta.disabled = stdenv.hostPlatform.isGhcjs
+in lib.recurseIntoAttrs ({
+  # Does not work on ghcjs because it needs zlib. Wasm needs network fixed.
+  meta.disabled = stdenv.hostPlatform.isGhcjs || stdenv.hostPlatform.isWasm
     # For some reason the `.tix` file is not created on armv7a android (not sure why)
-    || stdenv.hostPlatform.isAndroid && stdenv.hostPlatform.isAarch32;
+    || stdenv.hostPlatform.isAndroid && stdenv.hostPlatform.isAarch32
+    # The `input.txt` is not written (or just not found) for mingwW64 (ucrt64 works ok)
+    || (stdenv.hostPlatform.isWindows && stdenv.hostPlatform.libc != "ucrt");
   run = stdenv.mkDerivation {
     name = "coverage-test";
 
@@ -91,7 +94,7 @@ in recurseIntoAttrs ({
         dirExists "$pkga_basedir/html/pkga-0.1.0.0"
   
         pkgb_basedir="${project.hsPkgs.pkgb.coverageReport}/share/hpc/vanilla"
-        testTix="$pkgb_basedir/tix/pkgb-test-tests${crossSuffix}-0.1.0.0-check${crossSuffix}/tests${exeExt}.tix"
+        testTix="$pkgb_basedir/tix/pkgb-test-tests${crossSuffix'}-0.1.0.0-check${crossSuffix}/tests${exeExt}.tix"
         libTix="$pkgb_basedir/tix/pkgb-0.1.0.0/pkgb-0.1.0.0.tix"
         fileExistsNonEmpty "$testTix"
         fileExistsNonEmpty "$libTix"
@@ -118,8 +121,8 @@ in recurseIntoAttrs ({
         dirExists "$project_basedir/tix/pkga-0.1.0.0${inplaceSuffix}"
         dirExists "$project_basedir/tix/pkgb-0.1.0.0${inplaceSuffix}"
         fileExistsNonEmpty "$project_basedir/tix/pkgb-0.1.0.0${inplaceSuffix}/pkgb-0.1.0.0${inplaceSuffix}.tix"
-        dirExists "$project_basedir/tix/pkgb-test-tests${crossSuffix}-0.1.0.0-check${crossSuffix}"
-        fileExistsNonEmpty "$project_basedir/tix/pkgb-test-tests${crossSuffix}-0.1.0.0-check${crossSuffix}/tests${exeExt}.tix"
+        dirExists "$project_basedir/tix/pkgb-test-tests${crossSuffix'}-0.1.0.0-check${crossSuffix}"
+        fileExistsNonEmpty "$project_basedir/tix/pkgb-test-tests${crossSuffix'}-0.1.0.0-check${crossSuffix}/tests${exeExt}.tix"
       '';
       in ''
         ${check cabalProj "-inplace"}

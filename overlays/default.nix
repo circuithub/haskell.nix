@@ -31,7 +31,7 @@ let
         static-nix-tools' = pins:
           let
             # TODO replace once haskell-nix-examples nix-tools is in haskell.nix
-            zipFile = (import pins final).${final.system};
+            zipFile = (import pins final).${final.stdenv.hostPlatform.system};
             tarball = final.runCommand "nix-tools" {
               nativeBuildInputs = [ final.unzip ];
             } ''
@@ -45,12 +45,16 @@ let
             tarball // { exes = final.lib.genAttrs nix-tools-provided-exes (_: tarball); };
 
         static-nix-tools = static-nix-tools' ../nix-tools-static.nix;
+        # Any change to default-setup requires rebuilding everthing.
+        # Having a dedicated file for `default-setup` allows us to update
+        # the other `nix-tools` (like `make-install-plan`), without a
+        # full rebuild.
         static-nix-tools-for-default-setup = static-nix-tools' ../nix-tools-static-for-default-setup.nix;
 
         # Version of nix-tools built with a pinned version of haskell.nix.
         pinned-nix-tools-lib = (import final.haskell-nix.sources.flake-compat {
             pkgs = final;
-            inherit (final) system;
+            inherit (final.stdenv.hostPlatform) system;
             src = ../nix-tools;
             override-inputs = {
               # Avoid downloading another `hackage.nix`.
@@ -71,7 +75,7 @@ let
           };
         # For use building hadrian.  This way updating anything that modifies the
         # way hadrian is built will not cause a GHC rebuild.
-        pinned-haskell-nix = pinned-nix-tools-lib.haskell-nix final.system;
+        pinned-haskell-nix = pinned-nix-tools-lib.haskell-nix final.stdenv.hostPlatform.system;
       });
 
     bootstrap = import ./bootstrap.nix;
@@ -92,6 +96,7 @@ let
     cacheCompilerDeps = import ./cache-compiler-deps.nix;
     lazy-inputs = import ../lazy-inputs;
     rcodesign = import ./rcodesign.nix;
+    wasm = import ./wasm.nix;
   };
 
   composeExtensions = f: g: final: prev:
@@ -126,6 +131,7 @@ let
     cabalPkgConfig
     gobject-introspection
     hix
+    wasm
     # Restore nixpkgs haskell and haskellPackages
     (_: prev: { inherit (prev.haskell-nix-prev) haskell haskellPackages; })
     cacheCompilerDeps

@@ -22,7 +22,7 @@ in {
     };
     compilerSelection = mkOption {
       type = unspecified;
-      default = p: builtins.mapAttrs (_: x: x.override { hadrianEvalPackages = config.evalPackages; }) p.haskell-nix.compiler;
+      default = p: builtins.mapAttrs (_: x: x.override { ghcEvalPackages = config.evalPackages; }) p.haskell-nix.compiler;
       description = "Use GHC from pkgs.haskell instead of pkgs.haskell-nix";
     };
     index-state = mkOption {
@@ -143,6 +143,15 @@ in {
     extra-hackages = mkOption {
       type = nullOr (listOf unspecified);
       default = [];
+    };
+    prebuilt-depends = mkOption {
+      type = listOf package;
+      default = [];
+      description = ''
+        pre-built (perhaps proprietary) Haskell packages to make available as dependencies
+
+        See Note [prebuilt dependencies] for more details
+      '';
     };
   };
 }
