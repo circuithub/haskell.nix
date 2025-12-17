@@ -1,4 +1,4 @@
-{ stdenv, lib, cabalProject', haskellLib, recurseIntoAttrs, testSrc, compiler-nix-name, evalPackages, buildPackages }:
+{ stdenv, lib, cabalProject', haskellLib, testSrc, compiler-nix-name, evalPackages, buildPackages }:
 
 with lib;
 
@@ -10,12 +10,15 @@ let
   };
   packages = project.hsPkgs;
 
-in recurseIntoAttrs {
+in lib.recurseIntoAttrs {
   ifdInputs = {
     inherit (project) plan-nix;
   };
   run = stdenv.mkDerivation {
     name = "ghcjs-overlay-test";
+
+    # Double conversion needs updating for wasm
+    meta.disabled = stdenv.hostPlatform.isWasm;
 
     buildCommand = ''
       exe="${packages.ghcjs-overlay-test.components.exes.ghcjs-overlay-test.exePath}"

@@ -1,5 +1,5 @@
 # Test building TH code that needs DLLs when cross compiling for windows
-{ stdenv, lib, util, project', haskellLib, recurseIntoAttrs, testSrc, compiler-nix-name, evalPackages }:
+{ stdenv, lib, util, project', haskellLib, testSrc, compiler-nix-name, evalPackages }:
 
 with lib;
 
@@ -13,8 +13,8 @@ let
 
   packages = project.hsPkgs;
 
-in recurseIntoAttrs rec {
-  meta.disabled = stdenv.hostPlatform.isGhcjs;
+in lib.recurseIntoAttrs rec {
+  meta.disabled = stdenv.hostPlatform.isGhcjs || stdenv.hostPlatform.isWasm;
 
   ifdInputs = {
     inherit (project) plan-nix;

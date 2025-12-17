@@ -1,5 +1,5 @@
 # Test a package set
-{ stdenv, lib, util, cabalProject', haskellLib, recurseIntoAttrs, testSrc, compiler-nix-name, evalPackages }:
+{ stdenv, lib, util, cabalProject', haskellLib, testSrc, compiler-nix-name, evalPackages }:
 
 with lib;
 
@@ -28,9 +28,8 @@ let
   exe = (project.getComponent "cabal-simple:exe:cabal-simple")
     .override (lib.optionalAttrs stdenv.hostPlatform.isAndroid { setupBuildFlags = ["--ghc-option=-optl-static" ]; });
 
-in recurseIntoAttrs {
-  # This test seeems to be broken on 8.6 and 8.8 and ghcjs
-  meta.disabled = compiler-nix-name == "ghc865" || compiler-nix-name == "ghc884" || stdenv.hostPlatform.isGhcjs;
+in lib.recurseIntoAttrs {
+  meta.disabled = stdenv.hostPlatform.isGhcjs || stdenv.hostPlatform.isWasm;
   ifdInputs = {
     inherit (project) plan-nix;
   };

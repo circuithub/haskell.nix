@@ -14,7 +14,7 @@
 , cabalProjectLocal    ? null
 , cabalProjectFreeze   ? null
 , caller               ? "callCabalProjectToNix" # Name of the calling function for better warning messages
-, compilerSelection    ? p: builtins.mapAttrs (_: x: x.override { hadrianEvalPackages = evalPackages; }) p.haskell-nix.compiler
+, compilerSelection    ? p: builtins.mapAttrs (_: x: x.override { ghcEvalPackages = evalPackages; }) p.haskell-nix.compiler
 , ghcOverride   ? null # Used when we need to set ghc explicitly during bootstrapping
 , configureArgs ? "" # Extra arguments to pass to `cabal v2-configure`.
                      # `--enable-tests --enable-benchmarks` are included by default.
@@ -62,6 +62,7 @@
 , evalPackages
 , supportHpack ? false      # Run hpack on package.yaml files with no .cabal file
 , ignorePackageYaml ? false # Ignore package.yaml files even if they exist
+, prebuilt-depends ? []
 , ...
 }@args:
 let
@@ -89,7 +90,7 @@ let
       #
       # > The option `packages.Win32.package.identifier.name' is used but not defined.
       #
-      (compilerSelection pkgs)."${compiler-nix-name}";
+      (compilerSelection pkgs.buildPackages)."${compiler-nix-name}";
 
 in let
   ghc = if ghc' ? latestVersion
@@ -331,6 +332,8 @@ let
                 then "OSMinGW32"
               else if pkgs.stdenv.targetPlatform.isGhcjs
                 then "OSGhcjs"
+              else if pkgs.stdenv.targetPlatform.isWasi
+                then "OSWasi"
               else throw "Unknown target os ${pkgs.stdenv.targetPlatform.config}"
             }")'
           echo ',("target arch","${
@@ -346,6 +349,8 @@ let
                 then "ArchAArch32"
               else if pkgs.stdenv.targetPlatform.isJavaScript
                 then "ArchJavaScript"
+              else if pkgs.stdenv.targetPlatform.isWasm
+                then "ArchWasm32"
               else throw "Unknown target arch ${pkgs.stdenv.targetPlatform.config}"
           }")'
           echo ',("target platform string","${platformString pkgs.stdenv.targetPlatform}")'
@@ -367,6 +372,7 @@ let
   };
 
   dummy-ghc-pkg-dump = evalPackages.runCommand "dummy-ghc-pkg-dump" {
+      buildInputs = prebuilt-depends;
       nativeBuildInputs = [
         evalPackages.haskell-nix.nix-tools-unchecked.exes.cabal2json
         evalPackages.jq
@@ -531,6 +537,15 @@ let
                 LAST_PKG="ghcjs-th"
               ''
           }
+          for l in "''${pkgsHostTarget[@]}"; do
+            if [ -d "$l/package.conf.d" ]; then
+              files=("$l/package.conf.d/"*.conf)
+              for file in "''${files[@]}"; do
+                 cat "$file" >> $out
+                 echo '---' >> $out
+              done
+            fi
+          done
           for pkg in $PKGS; do
             varname="$(echo $pkg | tr "-" "_")"
             ver="VER_$varname"

@@ -1,4 +1,4 @@
-{ pkgs, stdenv, lib, haskellLib, recurseIntoAttrs, srcOnly }:
+{ pkgs, stdenv, lib, haskellLib, srcOnly }:
 
 
 with haskellLib;
@@ -166,7 +166,7 @@ in {
             components =
               if lib.isDerivation components || components == {}
                 then components
-                else recurseIntoAttrs components;
+                else lib.recurseIntoAttrs components;
           };
         packageFilter = _name: package: (package.isHaskell or false) && packageSel package;
         filteredPkgs = lib.filterAttrs packageFilter haskellPackages;
@@ -177,7 +177,7 @@ in {
           lib.filterAttrs (_: components: components != {}) (
             builtins.mapAttrs (_name: packages:
               builtins.foldl' (a: b: a // b) {} (map (x: x.components) packages)) packagesGroupedByName);
-    in recurseIntoAttrs combined;
+    in lib.recurseIntoAttrs combined;
 
   # Equivalent to collectComponents with (_: true) as selection function.
   # Useful for pre-filtered package-set.
@@ -193,7 +193,7 @@ in {
   # This can be used to collect all the test runs in your project, so that can be run in CI.
   collectChecks = packageSel: haskellPackages:
     let packageFilter = _name: package: (package.isHaskell or false) && packageSel package;
-    in recurseIntoAttrs (lib.filterAttrs (_: x: x != {} && x != recurseIntoAttrs {}) (lib.mapAttrs (_: p: p.checks) (lib.filterAttrs packageFilter haskellPackages)));
+    in lib.recurseIntoAttrs (lib.filterAttrs (_: x: x != {} && x != lib.recurseIntoAttrs {}) (lib.mapAttrs (_: p: p.checks) (lib.filterAttrs packageFilter haskellPackages)));
 
   # Equivalent to collectChecks with (_: true) as selection function.
   # Useful for pre-filtered package-set.
@@ -241,7 +241,7 @@ in {
   # Check a test component
   check = import ./check.nix {
     inherit stdenv lib haskellLib;
-    inherit (pkgs) buildPackages;
+    inherit (pkgs) pkgsBuildBuild;
   };
 
   # Do coverage of a package
@@ -326,7 +326,7 @@ in {
   };
 
   # Run evalModules passing the project function argument (m) as a module along with
-  # the the a projectType module (../modules/cabal-project.nix or ../modules/stack-project.nix).
+  # the a projectType module (../modules/cabal-project.nix or ../modules/stack-project.nix).
   # The resulting config is then passed to the project function's implementation.
   evalProjectModule = projectType: m: f:
     let project = f
@@ -471,6 +471,7 @@ in {
             ${component.passthru.identifier.component-id} = {
               type = "app";
               program = component.exePath;
+              inherit (component) meta;
             };
           })
           acc
@@ -531,8 +532,7 @@ in {
         , apps ? mkFlakeApps haskellPackages
         , checks ? mkFlakeChecks (collectChecks' haskellPackages)
         , coverage ? {}
-        , devShell ? project.shell
-        , devShells ? { default = devShell; }
+        , devShells ? { default = project.shell; }
         , checkedProject ? project.appendModule { checkMaterialization = true; }
         , ciJobs ? mkFlakeCiJobs project { inherit checks coverage packages devShells checkedProject; }
         , hydraJobs ? ciJobs
@@ -560,8 +560,7 @@ in {
           ciJobs
           # Used by:
           #   `nix develop`
-          devShells
-          devShell; # TODO remove devShell once everyone has nix that supports `devShells.default`
+          devShells;
       };
 
   # Adapt a standard project shell (`project.shell` or `haskell-nix.shellFor`)

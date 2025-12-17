@@ -1,6 +1,4 @@
 { pkgs, stdenv, buildPackages, pkgsBuildBuild, ghc, llvmPackages, lib, gobject-introspection ? null, haskellLib, makeConfigFiles, haddockBuilder, ghcForComponent, hsPkgs, compiler, runCommand, libffi, gmp, windows, zlib, ncurses, nodejs, nonReinstallablePkgs }@defaults:
-lib.makeOverridable (
-let self =
 { componentId
 , component
 , package
@@ -44,7 +42,7 @@ let self =
 , hardeningDisable ? component.hardeningDisable
 
 , enableStatic ? component.enableStatic
-, enableShared ? ghc.enableShared && component.enableShared && !haskellLib.isCrossHost
+, enableShared ? ghc.enableShared && component.enableShared && (!haskellLib.isCrossHost || stdenv.hostPlatform.isWasm)
 , enableExecutableDynamic ? component.enableExecutableDynamic && !stdenv.hostPlatform.isMusl
 , enableDeadCodeElimination ? component.enableDeadCodeElimination
 , writeHieFiles ? component.writeHieFiles
@@ -94,6 +92,135 @@ let self =
 , useLLVM ? ghc.useLLVM or false
 , smallAddressSpace ? false
 
+# Note [prebuilt dependencies]
+#
+# Typical cabal project planning starts with the libraries that come with
+# the compiler and then plans to build every other needed dependency from
+# source (fetched through hackage repositories or source-repository
+# dependencies). In cases where some library that isn't part of the compiler
+# is only available as a pre-built shared object file (such as for some
+# closed-source module from a vendor, or in principle a component whose
+# compilation is extremely expensive), we need to be able to tell cabal
+# about additional prebuilt dependencies to include in its plan and link to
+# as needed at build time.
+#
+# This can be done by passing the needed libraries in prebuilt-depends. During
+# cabal planning and builds, these libraries (and their dependencies) will be
+# present in the ghc-pkg database that cabal will draw from for its dependency
+# resolution, thereby skipping lookup from hackage or building from source.
+#
+# The entries in the prebuilt dependencies list may have dependencies that are
+# part of the compiler-provided package set, or may have overlap with each other.
+# GHC can actually handle this use case fine, since types from different packages
+# (even of the same name) will not unify, so at worst you will get a compile error,
+# but cabal will need to choose one for the packages you are building. The entries
+# in the list are given priority over the compiler-provided ones, with the later
+# entries having greater priority than the earlier ones.
+#
+# For your build to succeed, your prebuilt-dependencies must meet the following:
+#
+# 1. They are built with the same compiler version and RTS way.
+# 2. They have all of their dependencies within the package db directory or
+#    included as propagatedBuildInputs
+# 3. They must include the `envDep` and `exactDep` files that make-config.files.nix
+#    expects for configuring cabal precisely.
+#
+# The recommended way to meet this requirement is to build the relevant libraries
+# with haskell.nix too, since it sets up the dependencies appropriately. An example
+# workflow would be:
+#
+# 1. Build libraries foo and bar with haskell.nix (the same plan)
+# 2. Note down the store paths for foo and bar library outputs
+# 3. Make a full nix export of those store paths (using e.g. `nix-store --export $(nix-store --query --requisites $barPath $fooPath) > foobar.closure`
+# 4. On the consumer machine, import the store paths (e.g. `nix-store --import foobar.closure` and then add gc roots)
+# 5. In the consumer haskell.nix build, add the imported store paths to your prebuilt-depends. E.g.:
+#
+#      prebuilt-depends = let foo = {
+#        # We need to make this look like a call to derivation for stdenv to do the right thing
+#        name = "foo-lib-foo-0.1.0.0";
+#        type = "derivation";
+#        outputs = [ "out" ];
+#        out = foo;
+#        all = [ foo ];
+#        # $fooPath is already in the store due to the import, so we use the storePath
+#        # builtin to add it as a source dependency to the build. Note that this does
+#        # not work in pure evaluation mode, you must use --impure with flakes. An
+#        # alternative would be to bundle up all of the needed libraries into tarballs that
+#        # are fetched and unpacked as proper fixed-output derivations.
+#        outPath = builtins.storePath $fooPath;
+#      }; in [ foo ]; # Could also do the same for bar of course
+, prebuilt-depends ? []
+}:
+# makeOverridable is called here after all the `? DEFAULT` arguments
+# will have been applied.  This makes sure that `c.override (oldAttrs: {...})`
+# includes these `DEFAULT` values in `oldAttrs`.  This is important
+# so that overrides can modify the existing values instead of replacing them.
+lib.makeOverridable (
+let self =
+{ componentId
+, component
+, package
+, name
+, setup
+, src
+, flags
+, cabalFile
+, cabal-generator
+, patches
+, preUnpack
+, configureFlags
+, prePatch
+, postPatch
+, preConfigure
+, postConfigure
+, setupBuildFlags
+, preBuild
+, postBuild
+, preCheck
+, postCheck
+, setupInstallFlags
+, preInstall
+, postInstall
+, preHaddock
+, postHaddock
+, shellHook
+, configureAllComponents
+, allComponent
+, build-tools
+, pkgconfig
+, platforms
+, frameworks
+, dontPatchELF
+, dontStrip
+, dontUpdateAutotoolsGnuConfigScripts
+, hardeningDisable
+, enableStatic
+, enableShared
+, enableExecutableDynamic
+, enableDeadCodeElimination
+, writeHieFiles
+, ghcOptions
+, contentAddressed
+, doHaddock
+, doHoogle
+, hyperlinkSource
+, quickjump
+, keepConfigFiles
+, keepGhc
+, keepSource
+, setupHaddockFlags
+, enableLibraryProfiling
+, enableProfiling
+, profilingDetail
+, doCoverage
+, enableSeparateDataOutput
+, enableLibraryForGhci
+, enableDebugRTS
+, enableDWARF
+, enableTSanRTS
+, useLLVM
+, smallAddressSpace
+, prebuilt-depends
 }@drvArgs:
 
 let
@@ -147,7 +274,7 @@ let
   configFiles = makeConfigFiles {
     component = componentForSetup;
     inherit (package) identifier;
-    inherit fullName flags needsProfiling enableDWARF;
+    inherit fullName flags needsProfiling enableDWARF prebuilt-depends;
   };
 
   enableFeature = enable: feature:
@@ -218,7 +345,7 @@ let
       # lld -r --whole-archive ... will _not_ drop lazy symbols. However the
       # --whole-archive flag needs to come _before_ the objects, it's applied in
       # sequence. The proper fix is thusly to add --while-archive to Cabal.
-      (enableFeature (enableLibraryForGhci && !stdenv.hostPlatform.isGhcjs && !stdenv.hostPlatform.isAndroid) "library-for-ghci")
+      (enableFeature (enableLibraryForGhci && !stdenv.hostPlatform.isGhcjs && !stdenv.hostPlatform.isWasm && !stdenv.hostPlatform.isAndroid) "library-for-ghci")
     ] ++ lib.optionals (stdenv.hostPlatform.isMusl && (haskellLib.isExecutableType componentId)) [
       # These flags will make sure the resulting executable is statically linked.
       # If it uses other libraries it may be necessary for to add more
@@ -282,8 +409,11 @@ let
                      if builtins.isFunction shellHook then shellHook { inherit package shellWrappers; }
                      else abort "shellHook should be a string or a function";
 
-  exeExt = if stdenv.hostPlatform.isGhcjs && builtins.compareVersions defaults.ghc.version "9.8" < 0
-    then ".jsexe/all.js"
+  exeExt =
+    if stdenv.hostPlatform.isWasm
+      then ".wasm"
+    else if stdenv.hostPlatform.isGhcjs && builtins.compareVersions defaults.ghc.version "9.8" < 0
+      then ".jsexe/all.js"
     else stdenv.hostPlatform.extensions.executable;
   exeName = componentId.cname + exeExt;
   testExecutable = "dist/build/${componentId.cname}/${exeName}";
@@ -339,7 +469,7 @@ let
     }
     // lib.optionalAttrs stdenv.hostPlatform.isMusl {
       # This fixes musl compilation of TH code that depends on C++ (for instance TH code that uses the double-conversion package)
-      LD_LIBRARY_PATH="${pkgs.buildPackages.gcc-unwrapped.lib}/x86_64-unknown-linux-musl/lib";
+      LD_LIBRARY_PATH="${pkgs.buildPackages.gcc-unwrapped.lib}/${stdenv.hostPlatform.config}/lib";
     }
     // lib.optionalAttrs dontUpdateAutotoolsGnuConfigScripts {
       inherit dontUpdateAutotoolsGnuConfigScripts;
@@ -430,7 +560,7 @@ let
     nativeBuildInputs =
       [ghc buildPackages.removeReferencesTo]
       ++ executableToolDepends
-      ++ (lib.optional stdenv.hostPlatform.isGhcjs buildPackages.nodejs)
+      ++ (lib.optional stdenv.hostPlatform.isGhcjs pkgsBuildBuild.nodejs)
       ++ (lib.optional (ghc.useLdLld or false) llvmPackages.bintools);
 
     outputs = ["out"]
@@ -653,6 +783,10 @@ let
         mkdir -p $out/share
         if [ -d dist/build/extra-compilation-artifacts ]; then
           cp -r dist/build/extra-compilation-artifacts/hpc $out/share
+        elif [ -d ${testExecutable}-tmp/extra-compilation-artifacts ]; then
+          cp -r ${testExecutable}-tmp/extra-compilation-artifacts/hpc $out/share
+        elif [ -d dist/build/${componentId.cname}/extra-compilation-artifacts ]; then
+          cp -r dist/build/${componentId.cname}/extra-compilation-artifacts/hpc $out/share
         else
           cp -r dist/hpc $out/share
         fi
@@ -716,4 +850,69 @@ let
   // lib.optionalAttrs (hardeningDisable != [] || stdenv.hostPlatform.isMusl) {
     hardeningDisable = hardeningDisable ++ lib.optional stdenv.hostPlatform.isMusl "pie";
   });
-in drv; in self)
+in drv; in self) {
+  inherit componentId
+          component
+          package
+          name
+          setup
+          src
+          flags
+          cabalFile
+          cabal-generator
+          patches
+          preUnpack
+          configureFlags
+          prePatch
+          postPatch
+          preConfigure
+          postConfigure
+          setupBuildFlags
+          preBuild
+          postBuild
+          preCheck
+          postCheck
+          setupInstallFlags
+          preInstall
+          postInstall
+          preHaddock
+          postHaddock
+          shellHook
+          configureAllComponents
+          allComponent
+          build-tools
+          pkgconfig
+          platforms
+          frameworks
+          dontPatchELF
+          dontStrip
+          dontUpdateAutotoolsGnuConfigScripts
+          hardeningDisable
+          enableStatic
+          enableShared
+          enableExecutableDynamic
+          enableDeadCodeElimination
+          writeHieFiles
+          ghcOptions
+          contentAddressed
+          doHaddock
+          doHoogle
+          hyperlinkSource
+          quickjump
+          keepConfigFiles
+          keepGhc
+          keepSource
+          setupHaddockFlags
+          enableLibraryProfiling
+          enableProfiling
+          profilingDetail
+          doCoverage
+          enableSeparateDataOutput
+          enableLibraryForGhci
+          enableDebugRTS
+          enableDWARF
+          enableTSanRTS
+          useLLVM
+          smallAddressSpace
+          prebuilt-depends;
+}
