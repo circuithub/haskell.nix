@@ -186,6 +186,11 @@ in {
                 ++ onGhcjs (fromUntil "9.6.1" "9.6.3" ./patches/ghc/ghc-9.6-JS-implement-TH-support.patch)
                 ++ onGhcjs (fromUntil "9.6.3" "9.6.7" ./patches/ghc/ghc-9.6.3-JS-implement-TH-support.patch)
                 ++ onGhcjs (fromUntil "9.6.7" "9.8"   ./patches/ghc/ghc-9.6.7-JS-implement-TH-support.patch)
+                # hp2ps uses K&R-style extern void* malloc() without <stdlib.h>.
+                # GCC 15 treats this as zero-args, causing build failure.
+                # Fixed in 9.10.2 (proper prototype) and 9.12.4+ (<stdlib.h>).
+                ++ until               "9.10.2" ./patches/ghc/ghc-hp2ps-stdlib.patch
+                ++ fromUntil "9.12.1"  "9.12.3" ./patches/ghc/ghc-hp2ps-stdlib.patch
                 ++ fromUntil "9.8.1"  "9.8.2"  ./patches/ghc/ghc-9.8-cabal-c-soures-fix.patch
                 ++ fromUntil "9.6.3"  "9.6.5"  ./patches/ghc/ghc-9.6.3-Cabal-9384.patch
                 ++ fromUntil "9.8.1"  "9.8.3"    ./patches/ghc/ghc-9.6.3-Cabal-9384.patch
@@ -294,6 +299,10 @@ in {
                 ++ onAarch64Musl (fromUntil "9.6" "9.6.7" ./patches/ghc/ghc-9.6-0008-pool-improvements.patch)
                 ++ onAarch64Musl (fromUntil "9.8" "9.8.3" ./patches/ghc/ghc-9.6-0008-pool-improvements.patch)
                 ++ onAarch64Musl (fromUntil "9.10" "9.10.2" ./patches/ghc/ghc-9.6-0008-pool-improvements.patch)
+                # Use m32 allocator for BSS/COMMON to avoid aarch64 relocation overflow under qemu (cf #24432).
+                # GHC 9.6.7+, 9.8.3+, 9.10.2+ use m32 for regular sections but missed BSS and SHN_COMMON.
+                ++ onAarch64 (fromUntil "9.6.7" "9.8" ./patches/ghc/ghc-9.12-linker-use-m32-for-bss-and-common.patch)
+                ++ onAarch64 (from "9.8.3" ./patches/ghc/ghc-9.12-linker-use-m32-for-bss-and-common.patch)
                 # these two are abit questionable. They are pretty rough, and assume static binary as well as posix.
                 # onMusl (fromUntil "9.6" "9.11" ./patches/ghc/ghc-9.6-0004-ghcidladdr.patch)
                 # onMusl (fromUntil "9.6" "9.11" ./patches/ghc/ghc-9.6-0005-Better-interpreter-debugging.-Needs-ghcidladdr.patch)
@@ -1340,7 +1349,7 @@ in {
                 ghcVersion = "8.10.7";
                 compiler-nix-name = "ghc8107";
             }; in let targetPrefix = "js-unknown-ghcjs-"; in final.runCommand "${targetPrefix}ghc-8.10.7" {
-                nativeBuildInputs = [ final.xorg.lndir ];
+                nativeBuildInputs = [ (final.lndir or final.xorg.lndir) ];
                 passthru = {
                     inherit targetPrefix;
                     version = "8.10.7";

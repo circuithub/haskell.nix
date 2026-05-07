@@ -29,6 +29,12 @@ let
   };
 
 
+  # Shared with the regular nix-tools build (see
+  # ../cabal-install-patches.nix) so both builds patch
+  # cabal-install identically.
+  apply-cabal-install-patches = import ../cabal-install-patches.nix;
+
+
   apply-dontStrip-to-nix-tools = {
     packages.nix-tools.components.exes = {
       cabal-name.dontStrip = false;
@@ -73,6 +79,7 @@ let
 
     modules = [
       apply-hnix-patches
+      apply-cabal-install-patches
       apply-dontStrip-to-nix-tools
       add-static-libs-to-darwin
     ];
