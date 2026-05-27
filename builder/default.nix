@@ -69,9 +69,21 @@ let
           else ghc;
         inherit packages hoogle;
       };
-    in haskellLib.weakCallPackage pkgs nixpkgsHoogle {
-      inherit haskellPackages;
-    } (p: p.packages);
+      base = haskellLib.weakCallPackage pkgs nixpkgsHoogle {
+        inherit haskellPackages;
+      } (p: p.packages);
+    in
+      # nixpkgs's hoogle.nix inherits the transitive doc closure into a
+      # `docPackages` env var. On large package sets `docPackages=<paths>\0`
+      # crosses Linux's per-string MAX_ARG_STRLEN (32 * PAGE_SIZE = 131072
+      # bytes), so `execve` rejects the build with E2BIG before the builder
+      # runs. The value is only consumed at Nix eval time — the haddock paths
+      # are already inlined into `buildCommand` (which keeps their references
+      # tracked) — so blanking the env var is safe. Fixed upstream by moving
+      # the attribute to passthru; drop this once our nixpkgs pin includes it.
+      base.overrideAttrs (_: {
+        docPackages = [ ];
+      });
 
   # Same as haskellPackages.shellFor in nixpkgs.
   shellFor = haskellLib.weakCallPackage pkgs ./shell-for.nix {
