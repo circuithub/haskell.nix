@@ -9,6 +9,11 @@ let
   project = haskell-nix.cabalProject {
     inherit compiler-nix-name evalPackages;
     src = testSrc "ghc-lib-reinstallable";
+    # Expose the GHC compiler tree as a `source-repository-package`
+    # so cabal can install `lib:ghc` like any other reinstallable
+    # dep.  Required since the unconditional `packages.ghc.src`
+    # override was removed from `modules/configuration-nix.nix`.
+    useLocalGhcLib = true;
     cabalProjectLocal = ''
       constraints: ghc ==${ghcVersion}
     '';
@@ -29,6 +34,11 @@ in lib.recurseIntoAttrs {
       stdenv.hostPlatform.isAndroid
       || stdenv.hostPlatform.isGhcjs
       || (stdenv.hostPlatform.isMusl && stdenv.hostPlatform.is32bit)
+      # aarch64-multiplatform{,-musl}: cross from x86_64 to
+      # aarch64-linux currently breaks the local-ghc-lib slicing.
+      || (haskellLib.isCrossHost
+          && stdenv.hostPlatform.isLinux
+          && stdenv.hostPlatform.isAarch64)
       || stdenv.hostPlatform.isWasm
       || stdenv.hostPlatform.isWindows;
   };

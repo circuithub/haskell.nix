@@ -83,7 +83,7 @@
 
 # Debug
 , enableDebugRTS ? false
-, enableDWARF ? false
+, enableDWARF ? component.enableDWARF
 
 # This will only work with a custom TSan way enabled custom compiler
 , enableTSanRTS ? false
@@ -682,6 +682,13 @@ let
       (lib.optionalString stdenv.hostPlatform.isWindows ''
         export pkgsHostTargetAsString="''${pkgsHostTarget[@]}"
       '') +
+      # GHC only creates the -hiedir when it actually writes a .hie file, so a
+      # component with no compiled modules would leave the `hie` output missing
+      # and fail the derivation.  Create it up front so an empty HIE output is
+      # a valid result (see #1242).
+      (lib.optionalString writeHieFiles ''
+        mkdir -p $hie
+      '') +
       # The following could be refactored but would lead to many rebuilds
 
       # In case of content addressed components we need avoid parallel building (passing -j1)
@@ -831,10 +838,16 @@ let
       ''))
       + (lib.optionalString doCoverage ''
         mkdir -p $out/share
+        # cabal/Setup tucks `extra-compilation-artifacts/hpc` under
+        # one of a few build-dir layouts.  The per-component tmp
+        # dir is `dist/build/<cname>/<cname>-tmp` regardless of
+        # platform — note no `<exeExt>`, so we don't use
+        # `${testExecutable}-tmp` (`<cname>.exe-tmp` on Windows is
+        # a path cabal never creates).
         if [ -d dist/build/extra-compilation-artifacts ]; then
           cp -r dist/build/extra-compilation-artifacts/hpc $out/share
-        elif [ -d ${testExecutable}-tmp/extra-compilation-artifacts ]; then
-          cp -r ${testExecutable}-tmp/extra-compilation-artifacts/hpc $out/share
+        elif [ -d dist/build/${componentId.cname}/${componentId.cname}-tmp/extra-compilation-artifacts ]; then
+          cp -r dist/build/${componentId.cname}/${componentId.cname}-tmp/extra-compilation-artifacts/hpc $out/share
         elif [ -d dist/build/${componentId.cname}/extra-compilation-artifacts ]; then
           cp -r dist/build/${componentId.cname}/extra-compilation-artifacts/hpc $out/share
         else

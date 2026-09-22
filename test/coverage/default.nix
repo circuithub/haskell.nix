@@ -1,4 +1,4 @@
-{ stdenv, lib, cabal-install, cabalProject', stackProject', runCommand, testSrc, compiler-nix-name, evalPackages, buildPackages }:
+{ stdenv, lib, cabal-install, cabalProject', stackProject', runCommand, testSrc, compiler-nix-name, evalPackages, buildPackages, testCabalProjectLocal, testInputMap }:
 
 with lib;
 
@@ -13,11 +13,22 @@ let
     }];
   };
 
+  # See `docs/dev/profiling.md` for the v2 rationale — profiling /
+  # coverage toggles need to be in cabal.project so plan-nix
+  # records them.  Mirror the modules above here.
+  coverageProjectLocal = ''
+    package pkga
+      coverage: True
+    package pkgb
+      coverage: True
+  '';
+
   # We can easily select a different compiler when using cabal,
   # but for stack we would need a different resolver to be used..
   cabalProj = (cabalProject' (projectArgs // {
     inherit compiler-nix-name;
-    cabalProjectLocal = builtins.readFile ../cabal.project.local;
+    inputMap = testInputMap;
+    cabalProjectLocal = testCabalProjectLocal + coverageProjectLocal;
   }));
   stackProj = (stackProject' projectArgs);
 

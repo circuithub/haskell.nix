@@ -139,7 +139,24 @@
 
     enableSeparateDataOutput = lib.mkOption {
       type = lib.types.bool;
-      default = true;
+      # haskell.nix#2018: default to a single output on darwin.
+      #
+      # With a separate `data` output the executable (and any signed dylib)
+      # embeds a reference to its sibling `$data` output via the generated
+      # `Paths_*` module. When that `data` output already exists in the store,
+      # Nix cannot build over the immutable path, so it builds `$out` against a
+      # *scratch* `data` path and then — after the builder has exited — rewrites
+      # the scratch store hash to the final one inside the already-signed Mach-O
+      # (`registerOutputs` / `rewriteStrings`, logged "rewriting hashes ...;
+      # cross fingers"), *without* re-signing. On aarch64-darwin, where ad-hoc
+      # signatures are mandatory, that stale signature is invalid and macOS
+      # SIGKILLs the binary at launch.
+      #
+      # Defaulting to a single output makes `Paths_*` use `$out/share` — a
+      # self-reference, which Nix does not rewrite in normal/incremental builds —
+      # so the signature stays valid. Set explicitly to re-enable the separate
+      # output where the closure separation is worth more than this safety.
+      default = !pkgs.stdenv.buildPlatform.isDarwin;
     };
 
     enableLibraryForGhci = lib.mkOption {
@@ -150,6 +167,20 @@
     enableProfiling = lib.mkOption {
       type = lib.types.bool;
       default = false;
+    };
+
+    enableDWARF = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Compile the component with DWARF debug info (`-g`).
+        Populated automatically from `--enable-debug-info` entries in
+        plan.json's configure-args (see
+        `modules/install-plan/configure-args.nix`) so a
+        `cabal.project` `debug-info:` stanza flows through without
+        per-component module overrides.  When true, comp-builder
+        swaps in the `.dwarf` GHC variant and passes `-g3` to ghc.
+      '';
     };
 
     profilingDetail = lib.mkOption {

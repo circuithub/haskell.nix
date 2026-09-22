@@ -1,5 +1,5 @@
 # Test building TH code that needs DLLs when cross compiling for windows
-{ stdenv, lib, util, project', haskellLib, testSrc, compiler-nix-name, evalPackages, buildPackages }:
+{ stdenv, lib, util, project', haskellLib, testSrc, compiler-nix-name, evalPackages, buildPackages, testCabalProjectLocal, testInputMap }:
 
 with lib;
 
@@ -7,13 +7,30 @@ let
   project = project' {
     inherit compiler-nix-name evalPackages;
     src = testSrc "gi-gtk";
-    cabalProjectLocal = builtins.readFile ../cabal.project.local + ''
+    inputMap = testInputMap;
+    cabalProjectLocal = testCabalProjectLocal + ''
       -- The overloading feature of haskell-gi makes build times very long
       constraints: haskell-gi-overloading ==0.0
     '';
   };
 
+  # See `docs/dev/profiling.md` — v2 expects profiling toggles in
+  # cabal.project so plan-nix records `--enable-…-profiling`.
+  projectProfiled = project' {
+    inherit compiler-nix-name evalPackages;
+    src = testSrc "gi-gtk";
+    inputMap = testInputMap;
+    cabalProjectLocal = testCabalProjectLocal + ''
+      constraints: haskell-gi-overloading ==0.0
+      package *
+        library-profiling: True
+      package test-gi-gtk
+        profiling: True
+    '';
+  };
+
   packages = project.hsPkgs;
+  packagesProfiled = projectProfiled.hsPkgs;
 
 in lib.recurseIntoAttrs rec {
   meta.disabled = stdenv.hostPlatform.isGhcjs || stdenv.hostPlatform.isWasm
@@ -33,10 +50,11 @@ in lib.recurseIntoAttrs rec {
 
   ifdInputs = {
     inherit (project) plan-nix;
+    plan-nix-profiled = projectProfiled.plan-nix;
   };
 
   build = packages.test-gi-gtk.components.exes.test-gi-gtk;
   check = haskellLib.check build;
-  build-profiled = packages.test-gi-gtk.components.exes.test-gi-gtk.profiled;
+  build-profiled = packagesProfiled.test-gi-gtk.components.exes.test-gi-gtk;
   check-profiled = haskellLib.check build-profiled;
 }

@@ -1,4 +1,4 @@
-{ stdenv, lib, haskellLib, testSrc, compiler-nix-name, evalPackages, project' }:
+{ stdenv, lib, haskellLib, testSrc, compiler-nix-name, evalPackages, project', testCabalProjectLocal, testInputMap }:
 
 with lib;
 
@@ -6,30 +6,37 @@ let
   project = project' {
     inherit compiler-nix-name evalPackages;
     src = testSrc "shell-for";
-    cabalProjectLocal = builtins.readFile ../cabal.project.local;
+    inputMap = testInputMap;
+    cabalProjectLocal = testCabalProjectLocal;
     modules = [{ inherit evalPackages; }];
   };
 
   packages = project.hsPkgs;
 
   env = project.shellFor {
+    exposePackagesVia = "ghc-pkg";
     packages = ps: with ps; [ pkga pkgb ];
     tools = {
-      cabal.cabalProjectLocal = builtins.readFile ../cabal.project.local;
-      hoogle.cabalProjectLocal = builtins.readFile ../cabal.project.local;
+      cabal.inputMap = testInputMap;
+      cabal.cabalProjectLocal = testCabalProjectLocal;
+      hoogle.inputMap = testInputMap;
+      hoogle.cabalProjectLocal = testCabalProjectLocal;
     };
     exactDeps = true;
     packageSetupDeps = false;
   };
 
   envPkga = project.shellFor {
+    exposePackagesVia = "ghc-pkg";
     # Shell will provide the dependencies of pkga
     packages = ps: with ps; [ pkga ];
     # This adds cabal-install to the shell, which helps tests because
     # they use a nix-shell --pure. Normally you would BYO cabal-install.
     tools = {
-      cabal.cabalProjectLocal = builtins.readFile ../cabal.project.local;
-      hoogle.cabalProjectLocal = builtins.readFile ../cabal.project.local;
+      cabal.inputMap = testInputMap;
+      cabal.cabalProjectLocal = testCabalProjectLocal;
+      hoogle.inputMap = testInputMap;
+      hoogle.cabalProjectLocal = testCabalProjectLocal;
     };
     exactDeps = true;
     # Avoid duplicate package issues when runghc looks for packages
@@ -37,14 +44,17 @@ let
   };
 
   envDefault = project.shellFor {
+    exposePackagesVia = "ghc-pkg";
     # The default implementation of packages should use isLocal and the
     # result should be the same as:
     #   packages = ps: with ps; [ pkga pkgb ];
     # This adds cabal-install to the shell, which helps tests because
     # they use a nix-shell --pure. Normally you would BYO cabal-install.
     tools = {
-      cabal.cabalProjectLocal = builtins.readFile ../cabal.project.local;
-      hoogle.cabalProjectLocal = builtins.readFile ../cabal.project.local;
+      cabal.inputMap = testInputMap;
+      cabal.cabalProjectLocal = testCabalProjectLocal;
+      hoogle.inputMap = testInputMap;
+      hoogle.cabalProjectLocal = testCabalProjectLocal;
     };
     # Avoid duplicate package issues when runghc looks for packages
     packageSetupDeps = false;

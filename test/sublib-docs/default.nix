@@ -1,5 +1,5 @@
 # Test a package set
-{ stdenv, lib, util, cabalProject', haskellLib, testSrc, compiler-nix-name, evalPackages }:
+{ stdenv, lib, util, cabalProject', haskellLib, testSrc, compiler-nix-name, evalPackages, testCabalProjectLocal, testInputMap }:
 
 with lib;
 
@@ -7,7 +7,12 @@ let
   project = cabalProject' {
     inherit compiler-nix-name evalPackages;
     src = testSrc "sublib-docs";
-    cabalProjectLocal = builtins.readFile ../cabal.project.local;
+    inputMap = testInputMap;
+    cabalProjectLocal = testCabalProjectLocal + ''
+
+      package *
+        documentation: True
+    '';
   };
 
   packages = project.hsPkgs;
@@ -42,8 +47,15 @@ in lib.recurseIntoAttrs {
     '') + ''
 
       printf "check that it looks like we have docs..." >& 2
-      test -f "${packages.sublib-docs.components.library.doc}/share/doc/sublib-docs/html/Lib.html"
-      test -f "${packages.sublib-docs.components.sublibs.slib.doc}/share/doc/sublib-docs/html/slib/Slib.html"
+      # v1 writes haddock html into
+      # `share/doc/<pkg>/html/<Module>.html`; v2 uses each unit's
+      # `share/doc/html/<Module>.html` (the unit-id is hashed so we
+      # don't synthesise a path).  A non-anchored `find -name`
+      # accepts either layout.
+      test -f "$(find ${packages.sublib-docs.components.library.doc} \
+                       -name 'Lib.html' -print -quit)"
+      test -f "$(find ${packages.sublib-docs.components.sublibs.slib.doc} \
+                       -name '*Slib.html' -print -quit)"
 
       touch $out
     '';

@@ -17,8 +17,12 @@
     filterAttrsOnlyRecursive;
 
   # short names for nixpkgs versions
+  # x86_64-darwin only gets the 26.05 pin: nixpkgs unstable (26.11) dropped
+  # x86_64-darwin, so importing it for that system throws.  Every other system
+  # gets both the 26.05 stable pin and unstable.
   nixpkgsVersions = {
-    "R2511" = inputs.nixpkgs-2511;
+    "R2605" = inputs.nixpkgs-2605;
+  } // lib.optionalAttrs (system != "x86_64-darwin") {
     "unstable" = inputs.nixpkgs-unstable;
   };
 
@@ -64,7 +68,7 @@
       # cabal-install and nix-tools plans.  When removing a ghc version
       # from here (so that is no longer cached) also remove ./materialized/ghcXXX.
       # Update supported-ghc-versions.md to reflect any changes made here.
-      nixpkgs.lib.optionalAttrs (builtins.elem nixpkgsName ["R2411" "R2505" "R2511"]) {
+      nixpkgs.lib.optionalAttrs (builtins.elem nixpkgsName ["R2411" "R2505" "R2511" "R2605"]) {
         ghc96 = false;
         ghc98 = false;
         ghc910 = false;
@@ -114,11 +118,9 @@
         # Out llvm versions of GHC seem to break for musl32
         inherit (lib.systems.examples) musl32;
       } // lib.optionalAttrs (system == "x86_64-linux"
+          && nixpkgsName == "unstable"
           && !builtins.elem compiler-nix-name ["ghc967" "ghc984" "ghc9103"]) {
         inherit (lib.systems.examples) aarch64-android-prebuilt;
-      } // lib.optionalAttrs (system == "x86_64-linux"
-          && nixpkgsName != "unstable"
-          && !builtins.elem compiler-nix-name ["ghc967" "ghc984" "ghc9103" "ghc91320250523"]) {
         inherit (lib.systems.examples) armv7a-android-prebuilt;
       } // lib.optionalAttrs (system == "x86_64-linux" && nixpkgsName == "unstable" && !builtins.elem compiler-nix-name ["ghc8107" "ghc902"]) {
         # TODO fix this for the compilers we build with hadrian (ghc >=9.4)
@@ -130,7 +132,7 @@
 in
 dimension "Nixpkgs version" nixpkgsVersions (nixpkgsName: pinnedNixpkgsSrc:
   let evalPackages = import pinnedNixpkgsSrc (nixpkgsArgs // { system = evalSystem; });
-  in dimension "GHC version" (compilerNixNames nixpkgsName evalPackages) (compiler-nix-name: {runTests}:
+  in (dimension "GHC version" (compilerNixNames nixpkgsName evalPackages) (compiler-nix-name: {runTests}:
       let pkgs = import pinnedNixpkgsSrc (nixpkgsArgs // { inherit system; });
           build = import ./build.nix { inherit pkgs evalPackages ifdLevel compiler-nix-name haskellNix; };
           platformFilter = platformFilterGeneric pkgs system;
@@ -195,5 +197,12 @@ dimension "Nixpkgs version" nixpkgsVersions (nixpkgsName: pinnedNixpkgsSrc:
           hello = (pkgs.haskell-nix.hackage-package { name = "hello"; version = "1.0.0.2"; inherit evalPackages compiler-nix-name; }).getComponent "exe:hello";
         })
       ))
-    )
+    ))
+    # Run once (unstable, x86_64-linux): make sure the getting-started flake
+    # template stays in sync with `hix init` — see issue #2518.
+    // lib.optionalAttrs (nixpkgsName == "unstable" && system == "x86_64-linux") {
+      template-matches-hix-init = import ./test/template-matches-hix-init.nix {
+        pkgs = import pinnedNixpkgsSrc (nixpkgsArgs // { inherit system; });
+      };
+    }
   )

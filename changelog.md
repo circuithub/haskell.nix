@@ -1,6 +1,175 @@
 This file contains a summary of changes to Haskell.nix and `nix-tools`
 that will impact users.
 
+## August 17, 2026
+
+`builderVersion = 2`: `shellFor`'s `tools.cabal` now defaults to the same
+cabal-install the slice builder uses, instead of solving for the newest one
+in the project's hackage index.
+
+A UnitId is a hash of cabal-install's own rendering of a package's build
+inputs, so two cabal-install versions give the same package two different
+UnitIds.  When the shell's `cabal` was not the one that built the slices it
+missed every unit in the composed cabal store and rebuilt the whole
+dependency tree from source — no error, just a shell that had quietly
+stopped doing the one thing it exists for.  That is what happened when
+cabal-install 3.18.1.0 reached hackage on August 15 while the slice builder
+stayed pinned to 3.16.1.0.
+
+Only projects that ask for `shell.tools.cabal` are affected, and only when
+they do not pin a version.  An explicit pin still wins; you now get a
+warning when it isn't the version the slices were built with.
+
+The flakes we hand to users keep working on x86_64-darwin.  `hix init`, the
+`haskell-nix` flake template, the boilerplate behind `hix
+develop`/`build`/`run`, and the getting-started-flakes tutorial all follow
+`nixpkgs-unstable`, and nixpkgs 26.11 dropped that platform.  Because
+`flake-utils`' `eachSystem` evaluates every listed system in order to
+collect its output names, the one unimportable system broke `nix develop`
+and `nix build` on *all* of them — not just on Intel macOS.  Generated
+flakes now take a `nixpkgs-2605` input and import it for x86_64-darwin
+only, the same per-system selection haskell.nix's own `flake.nix` and
+`ci.nix` already make.
+
+## June 12, 2026
+
+`builderVersion = 2`: test `checks` now run with more of the environment
+`cabal v2-test` would provide, so tests that read their package's data,
+read source-relative files, or spawn build-tool executables work.
+
+The v2 check runs the installed test binary directly (rather than via
+`cabal v2-test`) in an empty directory with only the runtime libs on PATH,
+so `lib/check.nix` now additionally:
+
+  * sets each installed package's `<pkg>_datadir` (the env var Cabal's
+    `Paths_<pkg>` consults) at the `share` dir the slice stages under
+    `$out/store/ghc-*/<unit>/share`, so `getDataFileName` finds
+    `data-files` (the compiled-in datadir points at an ephemeral
+    build-time `cabal` dir);
+  * puts the component's `build-tool-depends` (`executableToolDepends`,
+    including same-package exes a test spawns) on `PATH`; and
+  * runs the test from a writable copy of the package source subdir, so
+    tests that read source-relative files (golden files / fixtures) find
+    them — mirroring v1, which unpacks `src` and `cd`s into it.
+
+All three happen before `preCheck`, so a project's own `preCheck` can
+still override them.
+
+## June 9, 2026
+
+Derivations in the pkgconf → nixpkgs map (`lib/pkgconf-nixpkgs-map.nix`)
+may now carry a `pc-version` attribute, which `allPkgConfigWrapper`
+reports for `pkg-config --modversion` in preference to the derivation
+`.version`.
+
+This fixes a `builderVersion = 2` UnitId fork for packages whose `.pc`
+`Version:` field differs from the nixpkgs derivation `.version`.  The
+motivating case is `systemd`: `libsystemd.pc` reports only the major
+version (e.g. `258` / `259`) while the derivation `.version` carries a
+patch component (`258.5` / `259.3`).  plan-to-nix's `allPkgConfigWrapper`
+reported the `.version`, while the real `pkg-config` a v2 build slice runs
+reports the `.pc` value; cabal folds the resolved pkgconfig-dep version
+into `pkgHashPkgConfigDeps`, so a `pkgconfig-depends`-using package (e.g.
+`libsystemd-journal`) got a different UnitId in the slice than plan-nix
+recorded, failing the slice's expected-package check.
+
+`systemd` is now overridden to set `pc-version` to its major version
+(matching the `.pc`).  The `pkgconf-pc-version` test verifies that every
+`pc-version` package agrees with what the real `pkg-config --modversion`
+returns.
+
+## May 23, 2026
+
+**Breaking change:** `cabalProjectLocal` and `cabalProjectFreeze`
+no longer auto-load `cabal.project.local` / `cabal.project.freeze`
+from the project source.  The option types are now `lines`
+(default `""`) instead of `nullOr lines` with a `readFile`-based
+default.
+
+Projects that relied on the implicit `readFile` behaviour should
+set the option explicitly:
+
+```nix
+haskell-nix.cabalProject {
+  src = ./.;
+  cabalProjectLocal = builtins.readFile ./cabal.project.local;
+  cabalProjectFreeze = builtins.readFile ./cabal.project.freeze;
+  # ...
+}
+```
+
+Reasons for the change:
+
+  * The implicit IFD-based default forced every project that
+    didn't want it (notably internal `hadrian` and
+    `ghc-extra-projects` builds) to set `cabalProjectLocal = null`
+    explicitly just to suppress the read.
+  * The `nullOr lines` type prevented haskell.nix from merging
+    project-level `cabalProjectLocal` content (`mkBefore` /
+    `mkAfter`) with explicit user values, which the new
+    platform-conditional defaults below rely on.
+
+Platform-conditional defaults are now injected into every cabal
+project's `cabalProjectLocal`:
+
+  * **musl host** — `package * \n executable-static: True`.
+    comp-builder already adds `--ghc-option=-optl=-static` at
+    build time; this surfaces the toggle in cabal.project so
+    plan-to-nix records `--enable-executable-static` for every
+    unit.  Observable build behaviour is unchanged.
+  * **x86_64-darwin host** — `package * \n library-for-ghci: True`.
+    Mirrors what comp-builder passes for `!ghcjs && !wasm && !android`,
+    so plan-nix's recorded UnitIds match the artefacts.
+  * **android host** — `package * \n ghc-options: -optl-static -optl-ldl`
+    (plus `-optl-no-pie` on aarch32).  Mirrors the
+    `setupBuildFlags` overrides previously applied only by
+    `lib/check.nix`'s test-exe re-wrap.
+  * **wasm GHC ≥ 9.12** — `package * \n shared: True`.  Wasm's RTS
+    linker only loads `.so` files; `--disable-shared` (the cabal
+    default) would force a `.a`-only install that TH-eval can't
+    load.
+
+These directives sit at `mkBefore` priority so a project's own
+`cabalProjectLocal` overrides them if needed.
+
+**Cache impact:** plan-nix hashes will change for affected
+platforms on the next CI run — a one-time rebuild wave.
+
+To opt out of a specific default, override it in your project's
+`cabalProjectLocal`:
+
+```nix
+cabalProjectLocal = ''
+  package *
+    executable-static: False
+'';
+```
+
+The post-plan `packages.ghc.src` override that
+`modules/configuration-nix.nix` used to apply unconditionally is
+now opt-in via the new project-level `useLocalGhcLib` option.
+
+If your project depends on / constrains the `ghc` package (e.g.
+uses `ghc-lib-reinstallable` or pins `lib:ghc`), add
+`useLocalGhcLib = true` to your project arguments:
+
+```nix
+haskell-nix.cabalProject {
+  # ...
+  useLocalGhcLib = true;
+}
+```
+
+For cabal projects this injects a `source-repository-package`
+block into `cabalProjectLocal` that points at the configured GHC
+tree.  For stack projects it re-applies the previous
+`packages.ghc.src` post-plan override.
+
+Symptoms when the flag is needed but not set: the planner fails
+because it can't satisfy a `ghc ==<version>` constraint against
+the boot package set, or `lib:ghc` is rejected with
+`allow-boot-library-installs` errors.
+
 ## Mar 24, 2026
 
 GHC options set in `cabal.project` files (via `package` or

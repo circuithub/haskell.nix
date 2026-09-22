@@ -1,22 +1,22 @@
-pkgs: let baseurl = "https://github.com/input-output-hk/haskell.nix/releases/download/nix-tools-0.4.3/"; in {
+pkgs: let baseurl = "https://github.com/input-output-hk/haskell.nix/releases/download/nix-tools-0.4.5/"; in {
   aarch64-darwin = pkgs.fetchurl { 
      name = "aarch64-darwin-nix-tools-static";
      url = "${baseurl}aarch64-darwin-nix-tools-static.zip";
-     sha256 = "sha256-VIG2Z7Kx1kM80FCfmFNKcztDTRmN+QyWD7EeVb/0Xwk=";
+     sha256 = "sha256-4CNihxEgM15PBxuBkMCb264/0tyciclVesmfVLQsQ/Y=";
   };
   x86_64-darwin = pkgs.fetchurl { 
      name = "x86_64-darwin-nix-tools-static";
      url = "${baseurl}x86_64-darwin-nix-tools-static.zip";
-     sha256 = "sha256-31VJFqz3gT9cO9TIerTLeqPrA5cwePYFoe+lScpkd5A=";
+     sha256 = "sha256-cWILZhf7n4BmoE++6yGFTn5sjkgRaITjplVEeF9jYCI=";
   };
   aarch64-linux = pkgs.fetchurl { 
      name = "aarch64-linux-nix-tools-static";
      url = "${baseurl}aarch64-linux-nix-tools-static.zip";
-     sha256 = "sha256-7iqwekEi9mumGqFpl26PMx1tXXMx8n/rd1tXW4rU8vY=";
+     sha256 = "sha256-Ku+6Kx80GfLFXAbPuj5HWLd9+v1P7jUmt/02XWek7Y4=";
   };
   x86_64-linux = pkgs.fetchurl { 
      name = "x86_64-linux-nix-tools-static";
      url = "${baseurl}x86_64-linux-nix-tools-static.zip";
-     sha256 = "sha256-fdw5fCqM9Rm1PQqrwC0hypBuSxQCrwdDke47kp0vxHQ=";
+     sha256 = "sha256-iA1V2XmAKywd/FPJHfrOtb1VpBRqTqanSa+r25g0HLA=";
   };
 }

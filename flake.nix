@@ -9,6 +9,9 @@
     nixpkgs-2411 = { url = "github:NixOS/nixpkgs/nixpkgs-24.11-darwin"; };
     nixpkgs-2505 = { url = "github:NixOS/nixpkgs/nixpkgs-25.05-darwin"; };
     nixpkgs-2511 = { url = "github:NixOS/nixpkgs/nixpkgs-25.11-darwin"; };
+    # nixpkgs 26.05 is the last release supporting x86_64-darwin (unstable /
+    # 26.11 dropped it), so the CI matrix uses this pin for x86_64-darwin.
+    nixpkgs-2605 = { url = "github:NixOS/nixpkgs/nixpkgs-26.05-darwin"; };
     nixpkgs-unstable = { url = "github:NixOS/nixpkgs/nixpkgs-unstable"; };
     flake-compat = { url = "github:input-output-hk/flake-compat/hkm/gitlab-fix"; flake = false; };
     "hls-1.10" = { url = "github:haskell/haskell-language-server/1.10.0.0"; flake = false; };
@@ -69,20 +72,45 @@
       url = "github:stable-haskell/iserv-proxy?ref=iserv-syms";
       flake = false;
     };
+    # head.hackage's patches, plus the tool its CI uses to turn them into a
+    # package repository.  We build the repository ourselves rather than
+    # downloading the published one -- see overlays/head-hackage.nix.
+    head-hackage = {
+      url = "gitlab:ghc/head.hackage?host=gitlab.haskell.org";
+      flake = false;
+    };
+    hackage-overlay-repo-tool = {
+      url = "github:bgamari/hackage-overlay-repo-tool";
+      flake = false;
+    };
   };
 
   outputs =
     { self
     , nixpkgs
     , nixpkgs-unstable
+    , nixpkgs-2605
     , flake-compat
     , ...
     }@inputs:
     let
       callFlake = import flake-compat;
-
       ifdLevel = 3;
       runningHydraEvalTest = false;
+      # The system that evaluation-time derivations (plan-to-nix, dummy-ghc,
+      # hadrian's plan) are built on.  This is deliberately *not* the target
+      # system: our Hydra has 10 darwin builders, so evaluating there is
+      # fastest on darwin regardless of which platform the jobs are for.
+      #
+      # It has to be stated explicitly rather than left to `ci.nix`'s
+      # `builtins.currentSystem or "aarch64-darwin"` default, because
+      # `currentSystem` does not exist under pure evaluation (`nix-eval-jobs
+      # --flake`, `nix path-info --derivation .#…`).  There the default
+      # silently became the literal "aarch64-darwin", which is right for Hydra
+      # but leaves any evaluator without darwin builders unable to evaluate
+      # *anything* -- including the linux jobs.  CI on GitHub-hosted runners
+      # overrides this to "x86_64-linux" (see .github/workflows/pipeline.yml).
+      evalSystem = "aarch64-darwin";
       defaultCompiler = "ghc967";
       config = import ./config.nix;
 
@@ -98,6 +126,12 @@
       traceHydraJobs = x: x // { inherit (traceNames "" x) hydraJobs; };
 
       # systems supported by haskell.nix
+      # NB: x86_64-darwin is still supported, but ONLY via the 26.05 nixpkgs pin
+      # — nixpkgs unstable (26.11) dropped x86_64-darwin ("Nixpkgs 26.11 has
+      # dropped support for x86_64-darwin").  So every unstable-based output
+      # (legacyPackages, the `unstable` ci dimension, the nix-tools subflake)
+      # falls back to / excludes x86_64-darwin accordingly; see the pin fallback
+      # in `legacyPackages*` below and the `nixpkgsVersions` gate in ci.nix.
       systems = [
         "x86_64-linux"
       ] ++ (if runningHydraEvalTest then [ ] else [
@@ -123,6 +157,19 @@
         overlay = self.overlays.combined;
         overlays = import ./overlays { sources = inputs; };
 
+        # `nix flake init --template github:input-output-hk/haskell.nix`
+        # scaffolds a new haskell.nix project (flake.nix + nix/hix.nix + a
+        # `hello` package).  Kept in-repo (rather than in NixOS/templates) so
+        # it stays in sync with the current `hix init` output and supported
+        # GHC versions.
+        templates = rec {
+          default = haskell-nix;
+          haskell-nix = {
+            path = ./templates/haskell-nix;
+            description = "A haskell.nix project: flake.nix, nix/hix.nix and a hello package.";
+          };
+        };
+
         internal = {
           nixpkgsArgs = {
             inherit config;
@@ -143,15 +190,19 @@
               (import ./default.nix);
         };
 
+        # nixpkgs unstable (26.11) dropped x86_64-darwin, so on that platform
+        # the "unstable" pkgs fall back to the 26.05 pin (the last release that
+        # supports it).  Everywhere else these track the unstable nixpkgs as
+        # before.
         legacyPackages = forEachSystem (system:
-          import nixpkgs {
+          import (if system == "x86_64-darwin" then nixpkgs-2605 else nixpkgs) {
             inherit config;
             overlays = [ self.overlay ];
             localSystem = { inherit system; };
           });
 
         legacyPackagesUnstable = forEachSystem (system:
-          import nixpkgs-unstable {
+          import (if system == "x86_64-darwin" then nixpkgs-2605 else nixpkgs-unstable) {
             inherit config;
             overlays = [ self.overlay ];
             localSystem = { inherit system; };
@@ -203,7 +254,7 @@
           stripAttrsForHydra (filterDerivations (
             # This is awkward.
             import ./ci.nix {
-              inherit ifdLevel system;
+              inherit ifdLevel system evalSystem;
               haskellNix = self;
             }
           )));
@@ -248,10 +299,54 @@
                 };
               in
               cf.defaultNix.hydraJobs;
+
+            # And the stable-haskell variant, from ./nix-tools-sh.  Same
+            # independence as above: its own flake, its own lock, no dependency
+            # on the haskell.nix in ./.
+            #
+            # It is a second copy of the subflake rather than a build variant of
+            # the first because the two cannot share a source tree -- the fork
+            # changes the Haskell sources (Cabal2Nix, MakeInstallPlan,
+            # ProjectPlanOutput, Freeze, setup-ghcjs) to suit the stable-haskell
+            # Cabal fork at 3.17, not only cabal.project.  Carrying both trees
+            # here, instead of keeping the fork on an unmerged branch, is what
+            # lets `nix-tools-sh-*` tags be cut from master commits exactly like
+            # mainline ones; see .github/workflows/upload-artifacts-sh.yml.
+            nix-tools-sh-hydraJobs =
+              let
+                cf = callFlake {
+                  inherit system;
+                  pkgs = self.legacyPackages.${system};
+                  src = ./nix-tools-sh;
+                };
+              in
+              cf.defaultNix.hydraJobs;
+
+            # The GHC compilers present in the CI matrix (the keys of the "GHC
+            # version" dimension, under each nixpkgs pin).  Used by the
+            # ci-status-matrix guard test below.
+            jobs = self.allJobs.${system};
+            ghcsInHydra = lib.unique (lib.concatMap
+              (pin: builtins.filter (lib.hasPrefix "ghc") (builtins.attrNames jobs.${pin}))
+              (builtins.filter (n: n != "meta" && n != "recurseForDerivations")
+                (builtins.attrNames jobs)));
           in
           self.allJobs.${system}
           // lib.optionalAttrs (ifdLevel > 2)
-            { nix-tools = nix-tools-hydraJobs.${system} or { }; }
+            { nix-tools = nix-tools-hydraJobs.${system} or { };
+              nix-tools-sh = nix-tools-sh-hydraJobs.${system} or { };
+            }
+          # Fail CI if a compiler enters/leaves the matrix without the README
+          # CI-status table's generator being updated to match.  Only needs to
+          # run on one system (the compiler dimension is system-independent).
+          // lib.optionalAttrs (system == "x86_64-linux")
+            { ci-status-matrix = import ./test/ci-status-matrix.nix {
+                inherit lib;
+                pkgs = self.legacyPackages.${system};
+                ghcs = ghcsInHydra;
+                scriptFile = ./scripts/update-ci-status.sh;
+              };
+            }
         );
 
         devShells = forEachSystemPkgs (pkgs:
@@ -280,27 +375,23 @@
       };
 
     in
-    traceHydraJobs (lib.recursiveUpdate flake (lib.optionalAttrs (ifdLevel > 2)
-      (
-        let pkgs = nixpkgs.legacyPackages."x86_64-linux"; in
-        {
-          hydraJobs.nix-tools = pkgs.releaseTools.aggregate {
-            name = "nix-tools";
-            constituents = (if runningHydraEvalTest then [ ] else [
-              "aarch64-darwin.nix-tools.static.zipped.nix-tools-static"
-              "x86_64-darwin.nix-tools.static.zipped.nix-tools-static"
-              "aarch64-darwin.nix-tools.static.zipped.nix-tools-static-no-ifd"
-              "x86_64-darwin.nix-tools.static.zipped.nix-tools-static-no-ifd"
-            ]) ++ [
-              "x86_64-linux.nix-tools.static.zipped.nix-tools-static"
-              "x86_64-linux.nix-tools.static.zipped.nix-tools-static-arm64"
-              "x86_64-linux.nix-tools.static.zipped.nix-tools-static-no-ifd"
-              "x86_64-linux.nix-tools.static.zipped.nix-tools-static-arm64-no-ifd"
-              (pkgs.writeText "gitrev" (self.rev or "0000000000000000000000000000000000000000"))
-            ];
-          };
-        }
-      )));
+    # There used to be a `hydraJobs.nix-tools` aggregate here, grouping the four
+    # `<system>.nix-tools.static.zipped.*` zips so `upload-artifacts.yml` had a
+    # single check to wait on.  It was expensive out of proportion to that.
+    #
+    # `releaseTools.aggregate` takes its constituents as job-name strings, which
+    # are Hydra metadata and create no nix dependency -- but nix-eval-jobs
+    # resolves named constituents and rewrites the derivation to depend on them,
+    # so the built `nix-tools.drv` really did list all four zips in `inputDrvs`.
+    # nix realises every input on the build machine whether the builder script
+    # reads it or not, so the aggregate dragged 476MB of zip closures onto
+    # whichever single agent Hydra happened to pick.  On the darwin-hosted linux
+    # builders, where import already dominates step time, that regularly hit the
+    # one-hour wall and failed, then retried elsewhere and copied it all again.
+    #
+    # The workflow now asks the Hydra API for the eval matching the commit and
+    # reads those four jobs from it directly, so nothing has to co-locate them.
+    traceHydraJobs flake;
 
   # --- Flake Local Nix Configuration ----------------------------
   nixConfig = {

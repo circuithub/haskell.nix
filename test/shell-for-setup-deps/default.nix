@@ -1,4 +1,4 @@
-{ stdenv, lib, cabal-install, cabalProject', runCommand, testSrc, compiler-nix-name, evalPackages }:
+{ stdenv, lib, cabal-install, cabalProject', runCommand, testSrc, compiler-nix-name, evalPackages, testCabalProjectLocal, testInputMap }:
 
 with lib;
 
@@ -6,11 +6,13 @@ let
   project = cabalProject' {
     inherit compiler-nix-name evalPackages;
     src = testSrc "shell-for-setup-deps";
-    cabalProjectLocal = builtins.readFile ../cabal.project.local;
+    inputMap = testInputMap;
+    cabalProjectLocal = testCabalProjectLocal;
   };
 
   env = project.shellFor {
-    tools.hoogle = { cabalProjectLocal = builtins.readFile ../cabal.project.local; };
+    exposePackagesVia = "ghc-pkg";
+    tools.hoogle = { inputMap = testInputMap; cabalProjectLocal = testCabalProjectLocal; };
     withHoogle = true;
   };
 
