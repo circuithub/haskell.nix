@@ -103,7 +103,6 @@ in let
     name = if name != null then "${name}-root-cabal-files" else "source-root-cabal-files";
     src = evalSrc.origSrc or evalSrc;
     filter = path: type: (!(evalSrc ? filter) || evalSrc.filter path type) && (
-      type == "directory" ||
       pkgs.lib.any (i: (pkgs.lib.hasSuffix i path)) [ ".cabal" "package.yaml" ]); };
 
   # When there is no `cabal.project` file `cabal-install` behaves as if there was
