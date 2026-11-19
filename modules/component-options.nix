@@ -6,6 +6,21 @@
       default = true;
     };
 
+    usesTemplateHaskell = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Declare that building this component runs Template Haskell splices.
+        When cross compiling (builder v2) for a dynamically linked musl
+        host, such a component is built with `-fexternal-interpreter`: the
+        in-process interpreter cannot load musl shared objects into the
+        glibc compiler.  Nothing can tell ahead of time whether a component
+        will evaluate a splice, so this has to be said by whoever knows --
+        e.g. in a project's `modules`:
+        `packages.th-orphans.components.library.usesTemplateHaskell = true;`
+      '';
+    };
+
     configureFlags = lib.mkOption {
       type = haskellLib.types.listOfFilteringNulls lib.types.str;
       default = [];
@@ -16,7 +31,40 @@
       default = [];
     };
 
+    buildJobs = lib.mkOption {
+      description = ''
+        Number of jobs to pass to `Setup build` as `-jN` for this component.
+        `null` (the default) keeps the standard behaviour of `-j` capped at
+        `min(NIX_BUILD_CORES, 4)`.  Set to `1` to build sequentially (useful
+        for memory-hungry packages that OOM under parallel builds), or to any
+        other positive integer to pin the parallelism.
+
+        The v2 (`builderVersion = 2`) builder passes it to the component's
+        slice, whose `Setup build` gets the same `-jN`.  Each library and
+        sublibrary is its own slice (except for `build-type: Custom`
+        packages, which build as one slice), so to cover a whole package set
+        `packages.<name>.buildJobs`, which applies to every component on
+        both builders.
+
+        Two v1 exceptions:
+
+        * `contentAddressed` components always build with `-j1`, because a
+          deterministic output is the point of `__contentAddressed`.  A larger
+          `buildJobs` is ignored there.
+        * ghcjs components pass no `-j` at all by default.  An explicitly set
+          `buildJobs` is honoured, but leaving it `null` does not introduce the
+          capped default.
+      '';
+      type = lib.types.nullOr lib.types.ints.positive;
+      default = null;
+    };
+
     testFlags = lib.mkOption {
+      description = ''
+        Extra command-line arguments passed to the test executable when its
+        check (`hsPkgs.<pkg>.checks.<name>`) runs it.
+        See docs/tutorials/testing.md.
+      '';
       type = haskellLib.types.listOfFilteringNulls lib.types.str;
       default = [];
     };
@@ -37,12 +85,25 @@
     };
 
     doCheck = lib.mkOption {
+      description = ''
+        Whether this test suite gets a check (`hsPkgs.<pkg>.checks.<name>`),
+        the derivation that runs it.  Tests with `doCheck = false` are left out
+        of `checks`, `collectChecks` and the flake `checks`; the test component
+        itself is still built by `components.tests.<name>`.
+        See docs/tutorials/testing.md.
+      '';
       type = lib.types.bool;
       default = true;
     };
 
     doCrossCheck = lib.mkOption {
-      description = "Run doCheck also in cross compilation settings. This can be tricky as the test logic must know how to run the tests on the target.";
+      description = ''
+        Set to true by haskell.nix's Windows and Linux cross overlays.  It does
+        not currently decide which checks exist or whether they run:
+        cross-compiled projects get a check for every test with `doCheck` set,
+        and whether it can run depends on `testWrapper`.
+        See docs/tutorials/testing.md.
+      '';
       type = lib.types.bool;
       default = false;
     };
@@ -73,6 +134,37 @@
 
     doCoverage = lib.mkOption {
       description = "Enable production of test coverage reports.";
+      type = lib.types.bool;
+      default = false;
+    };
+
+    generateOptparseApplicativeCompletions = lib.mkOption {
+      description = ''
+        Install bash, zsh and fish completion scripts for an executable
+        built with `optparse-applicative`, by running it with
+        `--bash-completion-script`, `--zsh-completion-script` and
+        `--fish-completion-script`, and installing them with nixpkgs'
+        `installShellCompletion` (in `share/bash-completion/completions`,
+        `share/zsh/site-functions` and `share/fish/vendor_completions.d`).
+
+        Only applies to `exes` components.  Set it on one exe
+        (`packages.foo.components.exes.foo.generateOptparseApplicativeCompletions = true;`)
+        or on a package to cover all of its exes (each must then use
+        optparse-applicative, or the build fails).  Do not set it for
+        the whole project: that covers every exe in the plan, build tools
+        such as `alex` and `happy` included.
+
+        The scripts are generated in a separate derivation that links to
+        the exe, so turning this on does not rebuild it.  The exe has to
+        run on the build machine: a cross compiled exe is run through the
+        component's `testWrapper` (an emulator), and when there is none
+        (or the host is Windows, JavaScript or WebAssembly) the exe is
+        left as it is, without completions (as nixpkgs'
+        `generateOptparseApplicativeCompletions` does when cross
+        compiling).
+        `haskellLib.addOptparseApplicativeCompletions` adds them to any
+        exe component derivation directly.
+      '';
       type = lib.types.bool;
       default = false;
     };

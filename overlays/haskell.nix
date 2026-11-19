@@ -23,6 +23,71 @@ final: prev: {
         # here and be explicit about imports and dependencies.
         callPackage = prev.lib.callPackageWith (final // final.haskell-nix);
 
+        # The systems on which plan-to-nix / IFD ("eval") derivations may
+        # run.  A project selects one via its `evalSystem` option; the
+        # eval-side artifacts (nixpkgs, dummy-ghc, configured-src, …) are
+        # memoised per entry so every project sharing an `evalSystem`
+        # reuses one instance instead of re-deriving it per `cabalProject`.
+        eval-systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+
+        # `requiredSystemFeatures` for the checks (`haskellLib.check`) whose
+        # test exes cannot run on an emulated builder; see
+        # `emulatorNativeBuilderCheck` below for which ones those are.
+        #
+        # Empty by default: this is build-farm policy, and requiring a
+        # feature the user's nix does not advertise would make these
+        # derivations unbuildable.  A farm that mixes real hosts with
+        # emulated ones opts in with an overlay that names a feature only
+        # its real hosts advertise.  haskell.nix's own CI (`ci.nix`) sets
+        # `[ "recursive-nix" ]`: not what these builds do, but a marker of
+        # convenience -- the zw3rk Hydra withholds it from the darwin
+        # hosts' linux `buildMachines` entries (the external derivation
+        # builder cannot implement it) while the one real linux host
+        # advertises it, so requiring it lands these checks exactly where
+        # their exes run.
+        #
+        # This used to pin much more: Template Haskell slices for hosts
+        # whose splices run through an emulator, a deny-list of packages
+        # (`base`, `th-orphans`), the native stage-2 GHC library, and
+        # Android ARM32 checks.  On 2026-10-24 all of those were built on
+        # the `nix-linux-builder` VMs instead and passed (th-dlls,
+        # js-template-haskell and with-packages for aarch64 glibc/musl,
+        # i686, mingw/ucrt and armv7a, plus the armv7a test exes, which
+        # qemu's PER_LINUX32 fallback from #2585 now runs).  What still
+        # fails there is a transient deadlock of the x86_64 cross ghc
+        # under Rosetta (all threads parked in `futex_lock_pi`); it hits
+        # ghc-internal and unix as often as base, so no package pin avoids
+        # it, and a retry builds.
+        emulatorSystemFeatures = prev.haskell-nix.emulatorSystemFeatures or [];
+
+        # Every check for a host platform matching this predicate is
+        # pinned.  32-bit x86 Linux (musl32) is the one that needs it: the
+        # test exe itself runs, but under Rosetta in a `nix-linux-builder`
+        # VM an i686 ELF that it spawns directly cannot be executed at all
+        #   check-datadir-tool: readCreateProcess: posix_spawnp: invalid
+        #   argument (Exec format error)
+        # (every attempt, on three VMs, in eval 3029), while the same check
+        # passes on a real x86_64 host.
+        emulatorNativeBuilderCheck =
+          prev.haskell-nix.emulatorNativeBuilderCheck
+            or (platform: platform.isLinux && platform.isx86_32);
+
+        # nixpkgs used to run `cabal` / `nix-tools`, keyed by eval system
+        # and memoised at the fixpoint level.  Non-native systems are
+        # imported lazily from the same nixpkgs path and overlays; the
+        # native `pkgsBuildBuild` system is always overlaid on top so it
+        # reuses the already-instantiated `pkgsBuildBuild` (no second
+        # import) AND is present even when it is not in `eval-systems`
+        # (future-proofing new host systems).  `genAttrs` is lazy, so the
+        # fresh-import thunk for the native key is created but never forced.
+        # Replaces the inline construction the `evalPackages` project option
+        # used to do (modules/project-common.nix), as a single shared
+        # attribute rather than one rebuilt per project.
+        evalPackages =
+          final.lib.genAttrs eval-systems (evalSystem:
+            import final.path { system = evalSystem; overlays = final.overlays; })
+          // { ${final.pkgsBuildBuild.stdenv.hostPlatform.system} = final.pkgsBuildBuild; };
+
         # ghc hackage patches.
         # these are patches that turn hackage packages into the same as the ones
         # ghc ships with the supposedly same version. See GHC Track Issue: 16199
@@ -43,6 +108,31 @@ final: prev: {
         hackageSrc = sources.hackage;
         # The only stack projects need hackage.nix now
         hackageForStack = import sources.hackage-for-stackage;
+
+        # Fetch a specific Hackage package version straight from Hackage using
+        # the sha256 recorded in hackage.nix (the `for-stackage` db) and unpack
+        # it into a source directory.  Unlike `hackage-package`, this bypasses
+        # the cabal solver and the project `index-state`, so it can supply an
+        # exact version that is newer than a project's pinned index-state — e.g.
+        # a GHC boot library that upstream pins via a direct
+        # `https://hackage.haskell.org/package/NAME-VER/NAME-VER.tar.gz` URL in
+        # its cabal.project.  Used by the `replace-hackage-tarball-urls` project
+        # option (see lib/call-cabal-project-to-nix.nix).  The result is a
+        # directory suitable for a cabal.project `packages:` entry.
+        hackageTarball = { name, version, evalPackages ? final.buildPackages }:
+          let
+            versions = hackageForStack.${name}
+              or (throw "hackageTarball: package '${name}' is not in hackage.nix");
+            entry = versions.${version}
+              or (throw "hackageTarball: '${name}-${version}' is not in hackage.nix");
+          in evalPackages.runCommand "${name}-${version}-src" { } ''
+            mkdir -p "$out"
+            tar -xzf ${evalPackages.fetchurl {
+              name = "${name}-${version}.tar.gz";
+              url = "mirror://hackage/${name}-${version}.tar.gz";
+              inherit (entry) sha256;
+            }} --strip-components=1 -C "$out"
+          '';
 
         # Contains the hashes of the cabal 01-index.tar.gz for given
         # index states.  Starting from April 1st 2019.
@@ -105,18 +195,78 @@ final: prev: {
             }:
             let
                 # The Stackage release referenced in the stack config
-                pkg-def = stackage.${stack-pkgs.resolver} or (throw ''
-                This version of stackage.nix does not know about the Stackage resolver ${stack-pkgs.resolver}.
-                You may need to update haskell.nix to one that includes a newer stackage.nix.
-                '');
+                # A compiler-only snapshot (`resolver: ghc-X`, or a snapshot
+                # file whose own resolver is `{ compiler: ghc-X }`, as every
+                # commercialhaskell/stackage-snapshots file has) is not a
+                # Stackage release, so updating stackage.nix will not help.
+                pkg-def = stackage.${stack-pkgs.resolver} or (throw (
+                  if final.lib.hasPrefix "ghc-" stack-pkgs.resolver
+                  then ''
+                  The stack project resolves to the compiler-only snapshot ${stack-pkgs.resolver},
+                  which haskell.nix does not support: it needs a Stackage release (lts-* or nightly-*).
+                  If the snapshot is a commercialhaskell/stackage-snapshots file, use the matching
+                  lts-X.Y or nightly-YYYY-MM-DD name as the resolver instead.
+                  ''
+                  else ''
+                  This version of stackage.nix does not know about the Stackage resolver ${stack-pkgs.resolver}.
+                  You may need to update haskell.nix to one that includes a newer stackage.nix.
+                  ''));
                 # The compiler referenced in the stack config
                 compiler = (stack-pkgs.extras hackageForStack).compiler or (pkg-def hackageForStack).compiler;
                 patchesModule = ghcHackagePatches.${compiler.nix-name} or {};
-                # Remove fake packages generated from stack keywords used in ghc-options
-                removeStackSpecial = module: if builtins.typeOf module == "set"
-                  then module // { packages = removeSpecialPackages (module.packages or {}); }
-                  else module;
-                removeSpecialPackages = ps: removeAttrs ps [ "$locals" "$targets" "$everything" ];
+                # stack-to-nix writes the `ghc-options` of stack.yaml as a
+                # module setting `packages.<key>.ghcOptions`, including stack's
+                # special keys, which are not packages.  A module that has any
+                # of them is replaced by `stackGhcOptionsModule`.
+                stackSpecialKeys = [ "$everything" "$locals" "$targets" ];
+                applyStackSpecial = module:
+                  let specials = builtins.intersectAttrs
+                        (final.lib.genAttrs stackSpecialKeys (_: null))
+                        (module.packages or {});
+                  in if builtins.typeOf module == "set" && specials != {}
+                    then {
+                      imports = [
+                        (removeAttrs module [ "packages" ])
+                        (stackGhcOptionsModule specials
+                          (removeAttrs module.packages stackSpecialKeys))
+                      ];
+                    }
+                    else module;
+                # The packages stack-to-nix generated (project packages and
+                # extra-deps).  Only these can be project packages.
+                stackPackageNames = builtins.attrNames
+                  ((stack-pkgs.extras hackageForStack).packages or {});
+                # Applies stack's special `ghc-options` keys:
+                #   `$everything`         every package: it becomes part of the
+                #                         project-wide `ghcOptions`, which every
+                #                         package receives (as `mkDefault`);
+                #   `$locals`, `$targets` project packages (stack's locals are
+                #                         its project packages, and haskell.nix
+                #                         builds all of them, so they are all
+                #                         targets too).
+                # A package that gets a definition of its own here (from its
+                # stack.yaml entry or from `$locals`/`$targets`) would lose that
+                # `mkDefault` copy, so its definition includes the project-wide
+                # `ghcOptions` explicitly.  The `mkOrder`s keep stack's order:
+                # `$everything` (and any other project-wide options), `$locals`,
+                # `$targets`, then the package's own entry (default order 1000).
+                stackGhcOptionsModule = specials: perPackage: { lib, config, ... }:
+                  let
+                    optsFor = key: specials.${key}.ghcOptions or [];
+                    projectOpts = optsFor "$locals" ++ optsFor "$targets";
+                    names = lib.unique (builtins.attrNames perPackage
+                      ++ lib.optionals (projectOpts != []) stackPackageNames);
+                  in {
+                    ghcOptions = lib.mkOrder 700 (optsFor "$everything");
+                    packages = lib.genAttrs names (name: (perPackage.${name} or {}) // {
+                      ghcOptions = lib.mkMerge ([
+                          (lib.mkOrder 700 config.ghcOptions)
+                        ] ++ lib.optional (projectOpts != [])
+                          (lib.mkIf config.packages.${name}.package.isProject
+                            (lib.mkOrder 800 projectOpts))
+                          ++ [ (perPackage.${name}.ghcOptions or []) ]);
+                    });
+                  };
             in mkPkgSet {
                 pkg-def = excludeBootPackages compiler.nix-name pkg-def;
                 pkg-def-extras = [ stack-pkgs.extras
@@ -127,7 +277,7 @@ final: prev: {
                 # and we should trust stackage here!
                 modules = [ { doExactConfig = true; } patchesModule ]
                        ++ modules
-                       ++ map removeStackSpecial (stack-pkgs.modules or []);
+                       ++ map applyStackSpecial (stack-pkgs.modules or []);
                 hackage = hackageForStack;
             };
 
@@ -229,7 +379,7 @@ final: prev: {
           })
         ];
 
-        dotCabal = { index-state, sha256, extra-hackage-tarballs ? {}, extra-hackage-repos ? {}, nix-tools, ... }:
+        dotCabal = { index-state, sha256, extra-hackage-tarballs ? {}, extra-hackage-repos ? {}, nix-tools, prepopulateHackageIndex ? true, ... }:
             let
               # NOTE: root-keys: aaa is because key-threshold: 0 does not seem to be enough by itself
               bootstrapIndexTarball = name: index: final.runCommand "cabal-bootstrap-index-tarball-${name}" {
@@ -248,17 +398,42 @@ final: prev: {
                 cp -r $HOME/.cabal/packages/${name} $out
                 '';
 
+              # An empty hackage index, for projects that resolve nothing from
+              # hackage (`active-repositories: :none` with every package pinned
+              # locally, e.g. the stable-haskell GHCs).  cabal parses the
+              # prepopulated index at startup regardless of active-repositories,
+              # so a full ~1.2 GB index costs seconds — minutes under emulation —
+              # for zero benefit; an empty one loads instantly.  Selected by
+              # `prepopulateHackageIndex = false`.
               # Produce a fixed output derivation from a moving target (hackage index tarball)
-              bootstrapped-hackage-tarball =
-                bootstrapIndexTarball "hackage.haskell.org"
-                (final.fetchurl {
+              fullHackageIndexTarball = final.fetchurl {
                   name = "01-index.tar.gz-at-${builtins.replaceStrings [ ":" ] [ "" ] index-state}";
                   url = "https://hackage.haskell.org/01-index.tar.gz";
                   downloadToTemp = true;
                   postFetch = "${nix-tools}/bin/truncate-index -o $out -i $downloadedFile -s ${index-state}";
                   outputHashAlgo = "sha256";
                   outputHash = sha256;
-                });
+                };
+
+              # A minimal hackage index, for projects that resolve nothing from
+              # hackage (every dependency pinned locally, `active-repositories:
+              # :none`).  cabal parses the prepopulated index on startup even
+              # under :none, so a full index costs seconds (minutes under
+              # emulation) for zero benefit.  cabal's index reader rejects a
+              # literally empty tar ("short tar trailer"), so we truncate the
+              # full index to an early index-state — a tiny but well-formed index
+              # (~2 MB vs ~1.2 GB) that cabal loads instantly.  The truncation
+              # input is the index FOD, whose store path is fixed by the
+              # project's index-state and its (immutable) sha256, so the plan
+              # does not recalculate when hackage.nix updates.  Selected by
+              # `prepopulateHackageIndex = false`.
+              emptyHackageIndexTarball = final.runCommand "minimal-01-index.tar.gz" {
+                preferLocalBuild = true;
+              } "${nix-tools}/bin/truncate-index -o $out -i ${fullHackageIndexTarball} -s 2008-01-01T00:00:00Z";
+
+              bootstrapped-hackage-tarball =
+                bootstrapIndexTarball "hackage.haskell.org"
+                (if prepopulateHackageIndex then fullHackageIndexTarball else emptyHackageIndexTarball);
 
               bootstrapped-extra-hackage-tarballs = final.lib.mapAttrs bootstrapIndexTarball extra-hackage-tarballs;
             in
@@ -402,6 +577,17 @@ final: prev: {
               # extra-hackage-tarballs | no            | workaround |
               # -----------------------+---------------+------------+
               #
+              # Secure extra-hackage-repos are re-bootstrapped (`cabal v2-update`
+              # from a `file:` url) with this `nix-tools`' cabal rather than
+              # linked as is.  A repo pinned with `--sha256` is a fixed-output
+              # derivation, so its `01-index.cache` was written by whichever cabal
+              # first built it and is never rebuilt.  When the binary format of
+              # that cache changes (as it did in cabal-install 3.19) cabal fails
+              # with "Non-matching structured hashes" and then cannot regenerate
+              # the cache in the read-only store.  The `aaa` root key works as in
+              # `bootstrapIndexTarball`; the repo was already verified when it was
+              # fetched.  (Do not add `--ignore-expiry`: with it cabal rejects the
+              # expired root.json of an old pinned repo, without it cabal accepts it.)
               final.runCommand "dot-cabal" {
                 nativeBuildInputs = [ nix-tools.exes.cabal (final.lndir or final.xorg.lndir) ] ++ cabal-issue-8352-workaround;
               } ''
@@ -411,7 +597,16 @@ final: prev: {
                 # prepopulate extra-hackage-repos
                 ${final.lib.concatStrings (final.lib.mapAttrsToList (name: repo: ''
                   mkdir -p $out/packages/${name}
-                  lndir ${repo} $out/packages/${name}
+                  if [ -e ${repo}/root.json ]; then
+                    CABAL_DIR=$(mktemp -d)
+                    mkdir -p $CABAL_DIR/packages/${name}
+                    printf 'repository %s\n  url: file:%s\n  secure: True\n  root-keys: aaa\n  key-threshold: 0\n' \
+                      ${name} ${repo} > $CABAL_DIR/config
+                    CABAL_DIR=$CABAL_DIR cabal v2-update ${name}
+                    cp -r $CABAL_DIR/packages/${name}/. $out/packages/${name}/
+                  else
+                    lndir ${repo} $out/packages/${name}
+                  fi
                 '') extra-hackage-repos)}
                 # prepopulate extra-hackage-tarballs
                 ${final.lib.concatStrings (final.lib.mapAttrsToList (name: repo: ''
@@ -482,12 +677,17 @@ final: prev: {
         # This handles private repositories with the `is-private` argument
         # (with `builtins.fetchGit`), as well as handling stack-based projects
         # with the `type` argument.
-        mkCacheLine = { name, url, rev, ref ? null, subdir ? ".", sha256 ? null, cabal-file ? "${name}.cabal", type ? "cabal", is-private ? false }:
+        mkCacheLine = { name, url, rev, ref ? null, subdir ? ".", sha256 ? null, cabal-file ? "${name}.cabal", type ? "cabal", is-private ? false, input ? null }:
           let
             # Fetch the entire repo, using either pkgs.fetchgit or
             # builtins.fetchGit depending on whether the repo is private.
+            # When the repo was resolved via `inputMap`
+            # (see `lib/stack-cache-generator.nix`) use the mapped local
+            # path / flake input directly instead of fetching it.
             entireRepo =
-              if is-private
+              if input != null
+              then input
+              else if is-private
               then
                 # It doesn't make sense to specify sha256 on a private repo
                 # because it is not used by buitins.fetchGit.
@@ -578,10 +778,28 @@ final: prev: {
             # TODO: this should be moved into `call-stack-to-nix`
             { packages =
                 let
-                  repoToAttr = { name, url, rev, ref ? null, sha256 ? null, subdir ? null, is-private ? false, ... }: {
+                  repoToAttr = { name, url, rev, ref ? null, sha256 ? null, subdir ? null, is-private ? false, input ? null, ... }:
+                    let hasSubdir = subdir != null && subdir != "."; in {
                     ${name} = {
                       src =
-                        if is-private
+                        # When a dependency url was resolved via `inputMap`
+                        # (see `lib/stack-cache-generator.nix`) use the mapped
+                        # local path / flake input directly instead of
+                        # fetching it again.  Select the subdir with
+                        # `cleanSourceWith` rather than the `postUnpack` below:
+                        # a mapped input may itself be a cleaned source, and
+                        # the component source cleaning assumes the package is
+                        # at the root of `src`, so it would drop the subdir.
+                        if input != null
+                        then
+                          if hasSubdir
+                            then final.haskell-nix.haskellLib.cleanSourceWith {
+                              src = input;
+                              subDir = subdir;
+                              name = "${name}-src";
+                            }
+                            else input
+                        else if is-private
                         then
                           builtins.fetchGit
                             ({ inherit url rev; } //
@@ -589,7 +807,7 @@ final: prev: {
                             )
                         else
                           final.fetchgit { inherit url rev sha256; };
-                    } // final.buildPackages.lib.optionalAttrs (subdir != null && subdir != ".") { postUnpack = "sourceRoot+=/${subdir}; echo source root reset to $sourceRoot"; };
+                    } // final.buildPackages.lib.optionalAttrs (input == null && hasSubdir) { postUnpack = "sourceRoot+=/${subdir}; echo source root reset to $sourceRoot"; };
                   };
 
                   cacheMap = builtins.map repoToAttr cache;
@@ -655,7 +873,7 @@ final: prev: {
           projectModule: haskellLib.evalProjectModule ../modules/cabal-project.nix projectModule (
             { config, options, ... }:
             let
-              inherit (config) compiler-nix-name compilerSelection evalPackages;
+              inherit (config) compiler-nix-name compilerSelection evalPackages evalSystem;
               selectedCompiler = (compilerSelection final.buildPackages).${compiler-nix-name};
               callProjectResults = callCabalProjectToNix config;
               plan-pkgs = if !builtins.pathExists (callProjectResults.projectNix + "/plan.json")
@@ -696,10 +914,18 @@ final: prev: {
                             then config.ghc
                           else
                             final.lib.mkDefault selectedCompiler;
-                        in if ghc.isHaskellNixCompiler or false then ghc.override { ghcEvalPackages = evalPackages; } else ghc;
+                        in if ghc.isHaskellNixCompiler or false then (ghc.evalWith.${evalSystem} or (ghc.override { evalSystem = evalSystem; })) else ghc;
                       compiler.nix-name = final.lib.mkForce config.compiler-nix-name;
                       evalPackages = final.lib.mkDefault evalPackages;
-                      inherit (config) prebuilt-depends builderVersion cabalProjectLocal;
+                      inherit (config) prebuilt-depends builderVersion v2LocalPackageSlices v2LocalPackageSliceNames cabalProject withBuildCompiler;
+                      # NOT `config.cabalProjectLocal`: the v2 shell writes
+                      # this text out as the user's `cabal.project.local`, so
+                      # its `source-repository-package` blocks have to be the
+                      # `file://` store rewrites plan-to-nix used, not the
+                      # original remote URLs (which cabal would clone over the
+                      # network).  See `fixedCabalProjectLocal` in
+                      # lib/call-cabal-project-to-nix.nix.
+                      cabalProjectLocal = callProjectResults.fixedCabalProjectLocal;
                     } ];
                   extra-hackages = config.extra-hackages or [] ++ callProjectResults.extra-hackages;
                 };
@@ -711,9 +937,15 @@ final: prev: {
                   args = config;
                   plan-nix = callProjectResults.projectNix;
                   inherit (callProjectResults) index-state-max;
-                  tool = final.buildPackages.haskell-nix.tool' evalPackages pkg-set.config.compiler.nix-name;
-                  tools = final.buildPackages.haskell-nix.tools' evalPackages pkg-set.config.compiler.nix-name;
-                  roots = final.haskell-nix.roots { compiler-nix-name = pkg-set.config.compiler.nix-name; inherit evalPackages; };
+                  # The offline `.cabal` dir (prepopulated hackage index at
+                  # the project's `index-state`) that plan-to-nix solved
+                  # against.  Exposed so a sandboxed `cabal` -- a v2 shell
+                  # test, say -- can solve against the very same index
+                  # instead of needing the network.
+                  inherit (callProjectResults) dotCabalDir;
+                  tool = final.buildPackages.haskell-nix.tool' evalSystem pkg-set.config.compiler.nix-name;
+                  tools = final.buildPackages.haskell-nix.tools' evalSystem pkg-set.config.compiler.nix-name;
+                  roots = final.haskell-nix.roots { compiler-nix-name = pkg-set.config.compiler.nix-name; inherit evalSystem; };
                   projectFunction = haskell-nix: haskell-nix.cabalProject';
                   inherit projectModule buildProject;
                 };
@@ -791,6 +1023,16 @@ final: prev: {
                 ) (builtins.removeAttrs rawProject.hsPkgs
                   # These are functions not packages
                   [ "shellFor" "makeConfigFiles" "ghcWithHoogle" "ghcWithPackages" "buildPackages" ]);
+
+            # The cabal-install the v2 builder (`builderVersion = 2`) builds
+            # this project's slices with.  A v2 shell's `cabal` must be this
+            # one for `cabal build` to reuse them (see `cabalTool` in
+            # builder/shell-for-v2.nix); `shellFor`'s `tools.cabal` picks it
+            # by default, and this is the same derivation for shells made
+            # some other way, e.g. `nativeBuildInputs = [ p.v2-cabal-install ]`.
+            v2-cabal-install =
+              let v2ci = final.pkgsBuildBuild.haskell-nix.v2-cabal-install;
+              in v2ci.evalWith.${rawProject.args.evalSystem or ""} or v2ci;
 
             projectCoverageReport = haskellLib.projectCoverageReport project (map (pkg: pkg.coverageReport) (final.lib.attrValues (haskellLib.selectProjectPackages hsPkgs)));
 
@@ -936,17 +1178,23 @@ final: prev: {
             flake' =
               let
                 combinePrefix = a: b: if a == "default" then b else "${a}-${b}";
-                mkFlake = project: haskellLib.mkFlake project rec {
+                # Only the unprefixed flake gets `packages.default` and
+                # `apps.default`: in a cross or variant flake they would
+                # become `<prefix>:default`, a second name for a component
+                # already there.
+                mkFlake = isMain: project: haskellLib.mkFlake project rec {
                   selectPackages = project.args.flake.packages;
                   coverage = final.lib.optionalAttrs project.args.flake.doCoverage
                     (haskellLib.projectCoverageCiJobs
                       project selectPackages project.args.flake.coverageProjectModule);
+                  inherit (project.args.flake) doHaddock;
+                  doDefaults = isMain && project.args.flake.doDefaults;
                 };
                 forAllCrossCompilers = prefix: project: (
-                    [{ ${prefix} = mkFlake project; }]
+                    [{ ${prefix} = mkFlake (prefix == "default") project; }]
                   ++ (map (project: {
                        ${combinePrefix prefix project.pkgs.stdenv.hostPlatform.config} =
-                         mkFlake project;
+                         mkFlake false project;
                       })
                      (project.args.flake.crossPlatforms project.projectCross)
                   ));
@@ -968,7 +1216,7 @@ final: prev: {
         stackProject' =
           projectModule: haskellLib.evalProjectModule ../modules/stack-project.nix projectModule (
             { config, options, ... }:
-            let inherit (config) evalPackages;
+            let inherit (config) evalPackages evalSystem;
                 callProjectResults = callStackToNix (config
                   // final.lib.optionalAttrs (config.cache == null) { inherit cache; });
                 generatedCache = genStackCache config;
@@ -983,7 +1231,7 @@ final: prev: {
                   modules = [ { _module.args.buildModules = final.lib.mkForce buildProject.pkg-set; }
                       (mkCacheModule cache) ]
                     ++ (config.modules or [])
-                    ++ final.lib.optional (config.ghc != null) { ghc.package = config.ghc.override { ghcEvalPackages = evalPackages; }; }
+                    ++ final.lib.optional (config.ghc != null) { ghc.package = config.ghc.evalWith.${evalSystem} or (config.ghc.override { evalSystem = evalSystem; }); }
                     ++ final.lib.optional (config.compiler-nix-name != null)
                         { compiler.nix-name = final.lib.mkForce config.compiler-nix-name; }
                     ++ [ { evalPackages = final.lib.mkDefault evalPackages;
@@ -997,9 +1245,9 @@ final: prev: {
                   inherit options;
                   args = config;
                   stack-nix = callProjectResults.projectNix;
-                  tool = final.buildPackages.haskell-nix.tool' evalPackages pkg-set.config.compiler.nix-name;
-                  tools = final.buildPackages.haskell-nix.tools' evalPackages pkg-set.config.compiler.nix-name;
-                  roots = final.haskell-nix.roots { compiler-nix-name = pkg-set.config.compiler.nix-name; inherit evalPackages; };
+                  tool = final.buildPackages.haskell-nix.tool' evalSystem pkg-set.config.compiler.nix-name;
+                  tools = final.buildPackages.haskell-nix.tools' evalSystem pkg-set.config.compiler.nix-name;
+                  roots = final.haskell-nix.roots { compiler-nix-name = pkg-set.config.compiler.nix-name; inherit evalSystem; };
                   projectFunction = haskell-nix: haskell-nix.stackProject';
                   inherit projectModule buildProject;
                 };
@@ -1074,6 +1322,116 @@ final: prev: {
         #   testProjectPlan = withInputs project.plan-nix;
         withInputs = final.lib.recurseIntoAttrs;
 
+        # The v2 builder's `cabal-install`, built via `haskell-nix.tool`:
+        # the stable-haskell cabal fork (3.19, branch hkm/sh-merge2-ports)
+        # pulled via source-repository-package — the same sources
+        # make-install-plan links (see nix-tools-sh/cabal.project).  That
+        # branch is Andrea Bedini's `stable-haskell/merge` (upstream master
+        # plus the cross-compilation series haskell/cabal#12356) with
+        # haskell.nix's fork commits on top.  It gives the per-slice
+        # `cabal v2-build` the cross-compilation "stage" system
+        # (--with-build-compiler / build: constraints) so build-time tool
+        # deps resolve in the build scope, and lets installed instances
+        # satisfy named sub-library deps — required by the ghc-bin slice,
+        # whose +threaded/+debug flags depend on the composed installed
+        # rts's flavour sublibs (rts:threaded-nodebug etc.).
+        #
+        # Two pins here:
+        #
+        #   * `builderVersion = 1` — cabal-install stays a v1 derivation.
+        #     Every v2 slice lists the v2 cabal-install as a
+        #     nativeBuildInput, so producing it as a v2 slice would cycle
+        #     on itself.
+        #
+        #   * `compilerSelection = p: p.haskell.compiler` — use nixpkgs's
+        #     pre-built GHC rather than haskell.nix's own (which would be
+        #     built by hadrian, itself a haskell.nix project whose hackage
+        #     deps become v2 slices needing the v2 cabal-install).
+        #     Pre-built nixpkgs GHC sidesteps the entire hadrian subtree.
+        #
+        # We go through `tool` (rather than nix-tools' pre-built cabal) so
+        # we can apply our own cabal-install patches.
+        #
+        # Defined here — one memoised definition per eval system (same
+        # pattern as `iserv-proxy-exes`) instead of a re-instantiation per
+        # project (builder/default.nix), and `roots` links its
+        # `.project.plan-nix`.  Always access it via
+        # `pkgsBuildBuild.haskell-nix.v2-cabal-install` (it is a build-host
+        # tool; going through pkgsBuildBuild shares the instance across
+        # cross pkgs).
+        v2-cabal-install =
+          let
+            # Pick the first GHC in this list that nixpkgs ships pre-built
+            # (under `haskell.compiler.<name>`).  `ghc9141` is the
+            # preference; `ghc9124` / `ghc9123` / `ghc9122` are kept as
+            # fallbacks for nixpkgs pins that don't carry 9.14 yet — going
+            # back further than 9.12 hasn't been needed in practice.  The
+            # exact GHC doesn't show up in any UnitId hash (this just
+            # builds the patched cabal-install binary), so any of these
+            # produces an equivalent v2 builder.
+            compiler-nix-name =
+              let candidates  = [ "ghc9141" "ghc9124" "ghc9123" "ghc9122" ];
+                  compilerSet = final.pkgsBuildBuild.haskell.compiler or {};
+                  picked      = final.lib.findFirst (n: compilerSet ? ${n}) null candidates;
+              in if picked == null
+                 then throw ("v2-cabal-install: none of [${final.lib.concatStringsSep ", " candidates}] "
+                          + "is present in `pkgs.haskell.compiler`; bump the candidates list "
+                          + "in `overlays/haskell.nix`.")
+                 else picked;
+            mkTool = evalSystem: final.pkgsBuildBuild.haskell-nix.tool compiler-nix-name "cabal" {
+              version = "3.19.0.0";
+              builderVersion = 1;
+              # Run the tool project's plan-to-nix on the consumer's eval
+              # platform.  Without this it defaults to the pkgsBuildBuild
+              # system, forcing IFD on (e.g.) x86_64-linux when the eval
+              # host is darwin.
+              inherit evalSystem;
+              compilerSelection = p: p.haskell.compiler;
+              cabalProjectLocal = ''
+                source-repository-package
+                    type: git
+                    location: https://github.com/stable-haskell/Cabal.git
+                    tag: 7156caf47a32a963e7a36328f32ce5940a743a3c
+                    --sha256: sha256-MogUmtmf7nmC1oR301OkODBfaespx3T9OVunrrpY5ZQ=
+                    subdir: Cabal
+                            Cabal-syntax
+                            cabal-install
+                            cabal-install-solver
+                            hooks-exe
+
+                -- hackage-security's releases bound Cabal/Cabal-syntax below
+                -- the fork's 3.19 (the stable-haskell/hackage-security fork
+                -- this used to pin is 0.6.3.2, capped at < 3.18).
+                allow-newer: hackage-security:Cabal, hackage-security:Cabal-syntax
+              '';
+              modules = [{
+                # (No sublib-pruning patch: a slice's solve needs the deps of
+                # every sublib in a package, even unused ones like vector's
+                # `benchmarks-O2` -> tasty, and it gets them -- plan-nix comes
+                # from an unpruned solve, so they are already in the slice's
+                # dep closure, as slices or as metadata-only index entries.)
+                packages.cabal-install.patches = [
+                  ../builder/cabal-install-patches/skip-installed-revdeps-in-completed.patch
+                  ../builder/cabal-install-patches/setup-build-num-jobs-env.patch
+                  ../builder/cabal-install-patches/wired-in-pins-follow-allow-boot-library-installs.patch
+                ];
+                # The Cabal LIBRARY, not the tool: `v2-build` links it in and
+                # uses it as the build system for `build-type: Simple`, so a
+                # patch here is what reaches the actual link command.
+                packages.Cabal.patches = [
+                  ../builder/cabal-install-patches/static-external-only-when-supported.patch
+                  ../builder/cabal-install-patches/no-object-for-unemitted-signature.patch
+                  ../builder/cabal-install-patches/configure-script-posix-path.patch
+                  # ordNub drops repeated -framework and -include pairs.
+                  ../builder/cabal-install-patches/hsc2hs-preserve-options.patch
+                ];
+              }];
+            };
+            byEvalSystem = final.lib.mapAttrs (evalSystem: _evalPackages:
+              mkTool evalSystem) final.haskell-nix.evalPackages;
+          in byEvalSystem.${final.pkgsBuildBuild.stdenv.hostPlatform.system}
+             // { evalWith = byEvalSystem; };
+
         iserv-proxy-exes = __mapAttrs (compiler-nix-name: _ghc:
             let
               # `profiled` controls whether the iserv-proxy project's
@@ -1083,9 +1441,9 @@ final: prev: {
               # `comp-v2-builder` reads configure-args from plan-nix
               # instead, so the toggle has to live in cabal.project
               # to make it through plan-nix into the v2 slice.
-              exes = profiled: pkgs: (pkgs.haskell-nix.cabalProject' ({pkgs, ...}: {
+              proj = evalSystem: profiled: pkgs: pkgs.haskell-nix.cabalProject' ({config, pkgs, ...}: {
                 name = "iserv-proxy";
-                inherit compiler-nix-name;
+                inherit compiler-nix-name evalSystem;
 
                 src = sources.iserv-proxy;
 
@@ -1102,6 +1460,15 @@ final: prev: {
                     # Opt out so iserv-proxy's slices use the
                     # unwrapped ghc.
                     crossTemplateHaskellSupport = false;
+                    # MinGW-w64 14's libmingwex `_assert` member references
+                    # `__acrt_iob_func` directly, and base imports
+                    # `__p__environ` through an IAT slot not registered by the
+                    # GHC RTS. Add both aliases to iserv's Windows symbol table.
+                    packages.iserv-proxy.patches = pkgs.lib.optionals (
+                         pkgs.stdenv.hostPlatform.isWindows
+                      && builtins.compareVersions pkgs.buildPackages.haskell-nix.compiler.${compiler-nix-name}.version "9.6.1" >= 0
+                      && builtins.compareVersions pkgs.buildPackages.haskell-nix.compiler.${compiler-nix-name}.version "9.11" < 0
+                    ) [ ./patches/iserv-proxy-windows-crt-symbols.patch ];
                   };
                 }];
 
@@ -1186,6 +1553,47 @@ final: prev: {
                         pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isAarch32 " -optl-no-pie"
                       }
                   ''
+                  # stable-haskell musl host: link the interpreter's libc
+                  # dynamically.  `executable-static: True` (every musl
+                  # host, modules/cabal-project.nix) is `-fully-static` on
+                  # the fork since 571f1a2ac, and a fully static musl
+                  # interpreter has no dlsym, so the RTS linker could not
+                  # resolve a single libc symbol for the archives a splice
+                  # loads -- every ghc914-sh aarch64-musl TH build since
+                  # then has died with
+                  #   iserv-proxy-interpreter: Failed to lookup symbol: strlen
+                  # (the mainline GHCs get them by loading libc.a, which
+                  # the fork's RTS linker now skips).  The interpreter only
+                  # ever runs on the build machine (directly or under
+                  # qemu), so nothing needs it static.  Haskell libraries
+                  # stay static; only libc &c. are shared.  The C++
+                  # runtime is linked in up front for the same reason as
+                  # ghc-iserv's (see its stanza in modules/cabal-project.nix):
+                  # dlopening nixpkgs' libstdc++.so cannot find its
+                  # libgcc_s.so.1.
+                  #
+                  # i386-musl's symbol table names musl's hidden
+                  # `__aio_close`, which only links fully static. The
+                  # i386 source patch above removes that table reference so
+                  # this interpreter can resolve the public libc symbols it
+                  # needs through dlsym like the other musl targets.
+                  #
+                  # pkgsStatic (`static`) has no libgcc_s, so there only
+                  # libc is linked dynamically (musl-static still ships
+                  # libc.so); the slice builder also drops the stdenv's
+                  # `-static` for this package (`iservDynamicLibc` in
+                  # builder/comp-v2-builder.nix).
+                  + pkgs.lib.optionalString (
+                       pkgs.stdenv.hostPlatform.isMusl
+                    && (!pkgs.stdenv.hostPlatform.isx86_32
+                      || (compiler-nix-name == "ghc914-sh"
+                        && pkgs.stdenv.hostPlatform.isLinux))
+                    && (final.buildPackages.haskell-nix.compiler.${compiler-nix-name}.emptyGlobalPackageDb or false)
+                  ) ''
+                    package iserv-proxy
+                      executable-static: False${pkgs.lib.optionalString (!pkgs.stdenv.hostPlatform.isStatic)
+                        "\n  ghc-options: -optl-Wl,--no-as-needed -optl-lstdc++ -optl-lgcc_s"}
+                  ''
                   # Build the iserv-proxy executables with profiling
                   # for the `-prof` variant.  GHC selects the iserv
                   # to spawn at TH-eval time by appending `-prof` to
@@ -1197,13 +1605,15 @@ final: prev: {
                     package iserv-proxy
                       profiling: True
                   '';
-              })).hsPkgs.iserv-proxy.components.exes;
-            in rec {
+              });
+              exes = evalSystem: profiled: pkgs:
+                (proj evalSystem profiled pkgs).hsPkgs.iserv-proxy.components.exes;
+              exesFor = evalSystem: rec {
               # We need the proxy for the build system and the interpreter for the target.
               # `iserv-proxy` is invoked on the build platform — it doesn't
               # need profiling, so use the non-profiled project.
-              inherit (exes false final.pkgsBuildBuild) iserv-proxy;
-              iserv-proxy-interpreter = (exes false final).iserv-proxy-interpreter.override
+              inherit (exes evalSystem false final.pkgsBuildBuild) iserv-proxy;
+              iserv-proxy-interpreter = (exes evalSystem false final).iserv-proxy-interpreter.override
                 (final.lib.optionalAttrs final.stdenv.hostPlatform.isAndroid {
                   setupBuildFlags = ["--ghc-option=-optl-static" "--ghc-option=-optl-ldl"] ++ final.lib.optional final.stdenv.hostPlatform.isAarch32 "--ghc-option=-optl-no-pie";
                   enableDebugRTS = true;
@@ -1216,7 +1626,7 @@ final: prev: {
               # cabal.project so v2's slice picks it up.  Keep the
               # v1-style `enableProfiling = true` override too in
               # case v1's comp-builder is ever in play here.
-              iserv-proxy-interpreter-prof = (exes true final).iserv-proxy-interpreter.override
+              iserv-proxy-interpreter-prof = (exes evalSystem true final).iserv-proxy-interpreter.override
                 ({ enableProfiling = true; }
                  // final.lib.optionalAttrs final.stdenv.hostPlatform.isAndroid {
                    setupBuildFlags = ["--ghc-option=-optl-static" "--ghc-option=-optl-ldl"] ++ final.lib.optional final.stdenv.hostPlatform.isAarch32 "--ghc-option=-optl-no-pie";
@@ -1225,7 +1635,31 @@ final: prev: {
                    setupBuildFlags = ["--ghc-option=-optl-Wl,--disable-dynamicbase,--disable-high-entropy-va,--image-base=0x400000" ];
                    enableDebugRTS = true;
                  });
-            }) final.haskell-nix.compiler;
+              # The plan-nix derivations behind the three exes above (the
+              # build-platform proxy and the host-platform interpreter share
+              # a plan only when build == host; the profiled interpreter's
+              # cabal.project differs, so its plan is always distinct).
+              # `haskell-nix.roots` links them so CI pushes them to the
+              # binary cache and later evaluations substitute the plans
+              # instead of building them mid-eval.
+              plan-nixes = {
+                iserv-proxy = (proj evalSystem false final.pkgsBuildBuild).plan-nix;
+                iserv-proxy-interpreter = (proj evalSystem false final).plan-nix;
+                iserv-proxy-interpreter-prof = (proj evalSystem true final).plan-nix;
+              };
+              };
+              # Memoised per-eval-system variants (same pattern as the
+              # compiler's `evalWith`, overlays/stable-haskell.nix): the
+              # exe derivations are identical for every eval system, but
+              # *computing* them forces the iserv-proxy plan-to-nix IFD on
+              # the project's eval platform — so consumers must select the
+              # variant matching their `evalSystem` or the IFD runs on the
+              # default (pkgsBuildBuild) system, which may not even have a
+              # builder on the eval host.
+              byEvalSystem = final.lib.mapAttrs (evalSystem: _evalPackages:
+                exesFor evalSystem) final.haskell-nix.evalPackages;
+            in byEvalSystem.${final.pkgsBuildBuild.stdenv.hostPlatform.system}
+               // { evalWith = byEvalSystem; }) final.haskell-nix.compiler;
 
           ghc-pre-existing = ghc: [
             "Cabal"
@@ -1281,10 +1715,16 @@ final: prev: {
             "rts-fs"
             "template-haskell-lift"
             "template-haskell-quasiquoter"
+          ] ++ final.lib.optionals (builtins.compareVersions ghc.version "9.14" >= 0
+               # rts.cabal: `if !flag(use-system-libffi) && !arch(javascript) && !arch(wasm32)`
+               && !(ghc.useSystemLibffi or false)
+               && !final.stdenv.targetPlatform.isGhcjs
+               && !final.stdenv.targetPlatform.isWasm) [
+            "libffi-clib"
           ] ++ final.lib.optionals (
                   !final.stdenv.targetPlatform.isGhcjs
                && !final.stdenv.targetPlatform.isWindows
-               && ghc.enableTerminfo or true) [
+               && ghc.hasTerminfo or ghc.enableTerminfo or true) [
             "terminfo"
           ] ++ (if final.stdenv.targetPlatform.isWindows
             then [ "Win32" ]
@@ -1295,14 +1735,43 @@ final: prev: {
         # are tested and cached. Consider using `p.roots` where `p` is a
         # project as it will automatically match the `compiler-nix-name`
         # of the project.
-        roots = { compiler-nix-name, evalPackages ? final.pkgsBuildBuild }@args: final.linkFarm "haskell-nix-roots-${compiler-nix-name}"
+        roots = { compiler-nix-name, ... }@args: final.linkFarm "haskell-nix-roots-${compiler-nix-name}"
           (final.lib.filter (x: x.name != "recurseForDerivations")
             (final.lib.mapAttrsToList (name: path: { inherit name path; })
               (roots' args 2)));
 
-        roots' = { compiler-nix-name, evalPackages ? final.pkgsBuildBuild }: ifdLevel:
+        # Takes `evalSystem` (a system string).  `evalPackages` (a nixpkgs),
+        # which it replaced, is still accepted with a deprecation warning.
+        roots' = { compiler-nix-name, ... }@rootsArgs: ifdLevel:
           let
-            ghc = final.buildPackages.haskell-nix.compiler.${compiler-nix-name}.override { ghcEvalPackages = evalPackages; };
+            evalSystem =
+              if rootsArgs ? evalPackages
+              then final.lib.warn
+                ("haskell-nix.roots: the `evalPackages` argument is deprecated; "
+                 + "pass `evalSystem = \"${rootsArgs.evalPackages.stdenv.hostPlatform.system}\";` instead.")
+                rootsArgs.evalPackages.stdenv.hostPlatform.system
+              else rootsArgs.evalSystem or final.pkgsBuildBuild.stdenv.hostPlatform.system;
+            evalPackages = final.haskell-nix.evalPackages.${evalSystem};
+            # The default (build-system) compiler variant and the variant for
+            # `evalSystem`.  Their final build derivations are identical; they
+            # differ only in where eval-time work (plan-to-nix IFD, dummy
+            # ghc/ghc-pkg) runs.
+            ghcBuild = final.buildPackages.haskell-nix.compiler.${compiler-nix-name};
+            ghc = ghcBuild.evalWith.${evalSystem}
+              or (ghcBuild.override { evalSystem = evalSystem; });
+            evalDiffers = evalSystem != final.pkgsBuildBuild.stdenv.hostPlatform.system;
+            # Link each attr `n` of `defaultAttrs` (the build-system drv —
+            # buildable by CI without IFD and substituted by native
+            # evaluators later) and, when the eval system differs from the
+            # build system, its eval-system twin as `n-eval` (realised
+            # during THIS evaluation anyway; linking it gets it pushed to
+            # the cache for other eval hosts of the same system).
+            withEvalVariants = defaultAttrs: evalAttrs:
+              defaultAttrs
+              // final.lib.optionalAttrs evalDiffers
+                   (final.lib.mapAttrs' (n: _: { name = "${n}-eval"; value = evalAttrs.${n}; }) defaultAttrs);
+            planNames = final.lib.mapAttrs' (n: v: { name = "plan-${n}"; value = v; });
+            v2ci = final.pkgsBuildBuild.haskell-nix.v2-cabal-install;
           in
             final.lib.recurseIntoAttrs ({
             # Things that require no IFD to build
@@ -1312,15 +1781,66 @@ final: prev: {
             inherit (evalPackages) nix gitMinimal nix-prefetch-git;
           } // final.lib.optionalAttrs (final.stdenv.hostPlatform.libc == "glibc") {
             inherit (final) glibcLocales;
-          } // final.lib.optionalAttrs (builtins.compareVersions ghc.version "9.4" >= 0) {
-            # Make sure the plan for hadrian is cached (we need it to instanciate ghc).
-            hadrian-plan = final.buildPackages.haskell-nix.compiler.${compiler-nix-name}.hadrianProject.plan-nix;
-            # Also include the same plan evaluated on the eval system.
-            hadrian-plan-eval = ghc.hadrianProject.plan-nix;
-          } // final.lib.optionalAttrs (ifdLevel > 0) {
+          }
+            # Cache every plan-nix needed to evaluate the compiler (hadrian
+            # for hadrian-built GHCs; stage1/stage2 for the stable-haskell
+            # ones).  A plan-nix that is not cached must be BUILT (via IFD)
+            # by whoever evaluates a project using the compiler — for
+            # hydra's evaluator that is the nix-eval-jobs hang class.
+            // withEvalVariants (planNames (ghcBuild.plan-nixes or {}))
+                                (planNames (ghc.plan-nixes or {}))
+            # (nix-tools needs no root: it is a prebuilt static bundle, with
+            # no `project` and so no plan to cache.)
+            # The v2 builder's patched cabal-install plan; only
+            # stable-haskell compilers use the v2 builder today, so gate on
+            # that rather than building the cabal fork for every compiler's
+            # roots.
+            // final.lib.optionalAttrs (ghcBuild.isStableHaskell or false)
+                 (withEvalVariants
+                   { plan-v2-cabal-install = v2ci.project.plan-nix; }
+                   { plan-v2-cabal-install = (v2ci.evalWith.${evalSystem} or v2ci).project.plan-nix; })
+            # The eval-time dummy ghc/ghc-pkg pair (and, through it, the
+            # eval-platform source trees it embeds) — realised during every
+            # project evaluation for compilers that carry it.
+            // final.lib.optionalAttrs (ghcBuild ? dummyGhcPkgs)
+                 (withEvalVariants
+                   { inherit (ghcBuild.dummyGhcPkgs) dummy-ghc dummy-ghc-pkg; }
+                   { inherit (ghc.dummyGhcPkgs) dummy-ghc dummy-ghc-pkg; })
+            # The C compiler for the host platform: for a cross package set
+            # this is the cross gcc that GHC's configure runs against.  It is
+            # a build-time input of the eval-time `configured-src` IFD, so if
+            # nothing roots it, a GC on the evaluator means the next eval of
+            # the same commit has to rebuild the whole cross toolchain before
+            # it can evaluate any job.  Rooting it via `ghc` alone isn't
+            # enough, because that only works once GHC itself builds.
+            # nixpkgs gives ghcjs no C compiler (`stdenv.cc` throws "no C
+            # compiler provided for this platform"), so skip it there.
+            // final.lib.optionalAttrs (!final.stdenv.hostPlatform.isGhcjs) {
+              cc = final.stdenv.cc;
+            }
+            // final.lib.optionalAttrs (ifdLevel > 0) {
             # Things that require one IFD to build (the inputs should be in level 0)
             inherit ghc;
             ghc-boot-packages-nix = final.ghc-boot-packages-nix.${compiler-nix-name};
+          } // final.lib.optionalAttrs (ifdLevel > 0 && ghcBuild ? configured-src) (
+            # The configured GHC source tree, read at evaluation time by
+            # `ghc-packages.nix`.  No job's runtime closure contains it, so
+            # without this the evaluator re-runs GHC's configure (and builds
+            # whatever it needs) after every GC.
+            withEvalVariants
+              { ghc-configured-src = ghcBuild.configured-src; }
+              { ghc-configured-src = ghc.configured-src; }
+          ) // final.lib.optionalAttrs (ifdLevel > 0 && ghc ? generated-light) {
+            # Cache hadrian's generated sources (primops / deriveConstants /
+            # config) built *without* compiling all of GHC.  Consumers pull
+            # these at evaluation time (`useLocalGhcLib` / `ghc-lib-reinstallable`
+            # and `ghc-boot-packages`); caching the derivation here means those
+            # evals substitute it instead of rebuilding it via IFD.
+            ghc-generated = ghc.generated-light;
+          } // final.lib.optionalAttrs (ifdLevel > 0 && ghc ? configured-src-check) {
+            # Cross compilers configure those eval-time trees with a nixpkgs
+            # boot GHC; check they match what the real boot GHC gives.
+            inherit (ghc) configured-src-check;
           } // final.lib.optionalAttrs (ifdLevel > 1) {
             # Things that require two levels of IFD to build (inputs should be in level 1)
             nix-tools-unchecked = final.pkgsBuildBuild.haskell-nix.nix-tools-unchecked;
@@ -1330,7 +1850,16 @@ final: prev: {
             # These seem to be the only things we use from `ghc-extra-packages`
             # in haskell.nix itself.
             && !final.stdenv.hostPlatform.isGhcjs
-            && !final.stdenv.hostPlatform.isWasm)
-              final.haskell-nix.iserv-proxy-exes.${compiler-nix-name});
+            && !final.stdenv.hostPlatform.isWasm
+            && final.haskell-nix.iserv-proxy-exes ? ${compiler-nix-name})
+              (let
+                iservDefault = final.haskell-nix.iserv-proxy-exes.${compiler-nix-name};
+                iservEval = iservDefault.evalWith.${evalSystem};
+              in builtins.removeAttrs iservEval [ "plan-nixes" ]
+                 # The plans behind the exes above, both variants (see
+                 # `withEvalVariants`) — cached so evaluating the exes
+                 # substitutes the plans instead of building them.
+                 // withEvalVariants (planNames iservDefault.plan-nixes)
+                                     (planNames iservEval.plan-nixes)));
     };
 }

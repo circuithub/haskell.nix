@@ -1,0 +1,66 @@
+Use the Stable Haskell GHC's `-fully-static` for `executable-static`.
+
+`executable-static: True` reaches Cabal as `withFullyStaticExe`, and
+`modules/cabal-project.nix` sets it in `package *` for every musl host,
+meaning "every executable should be statically linked" -- what haskell.nix's
+v1 builder does for musl with `--ghc-option=-optl=-static`.
+
+The stable-haskell/merge Cabal (3.19) spells that the upstream way,
+`ghcOptLinkOptions = ["-static"]` (`-optl-static`), which is right for
+upstream GHC.  A Stable Haskell GHC has a flag that says exactly this,
+`-fully-static` ("Link all libraries statically [...] This includes external
+libraries, Haskell libraries, as well as libc"), and ghc914-sh musl
+executables (iserv-proxy-interpreter's reference to musl's hidden
+`__aio_close`, the cabal-simple "statically linked" check) need it.
+
+Ask the compiler instead of assuming: the fork brands its `ghc --info` with
+`("Edition","Stable Haskell")` and upstream emits no such field (haskell.nix
+relies on the same discriminator in `lib/dummy-ghc.nix`).  Other compilers
+keep the merge's `-optl-static`.
+
+(Earlier versions of this patch replaced the older fork's `-static-external`,
+which deliberately left libc dynamic and which upstream GHC rejects.  The
+merge no longer emits it.)
+
+diff --git a/src/Distribution/Simple/GHC/Build/Link.hs b/src/Distribution/Simple/GHC/Build/Link.hs
+index 99f9135eb..c1e523943 100644
+--- a/src/Distribution/Simple/GHC/Build/Link.hs
++++ b/src/Distribution/Simple/GHC/Build/Link.hs
+@@ -9,6 +9,7 @@ import Prelude ()
+ import Control.Monad
+ import Control.Monad.IO.Class
+ import qualified Data.ByteString.Lazy.Char8 as BS
++import qualified Data.Map as Map
+ import qualified Data.Set as Set
+ import qualified Data.Text as Text
+ import Distribution.Backpack
+@@ -120,13 +121,28 @@ linkOrLoadComponent
+         | src <- extraSources
+         ]
+ 
++      -- `withFullyStaticExe` is `executable-static: True`.  A Stable Haskell
++      -- GHC has a `-fully-static` flag for that, which also links its own
++      -- runtime dependencies statically; upstream GHC does not, and only
++      -- gets the linker's `-static`.  The fork brands its `ghc --info` with
++      -- `Edition`, and upstream emits no such field.
++      ghcHasFullyStatic =
++        Map.lookup "Edition" (compilerProperties (compiler lbi))
++          == Just "Stable Haskell"
++
+       -- TODO: Shouldn't we use withStaticLib for libraries and something else
+       -- for foreign libs in the three cases where we use `withFullyStaticExe` below?
+       linkerOpts rpaths =
+         mempty
+-          { ghcOptLinkOptions =
++          { ghcOptExtraDefault =
++              [ "-fully-static"
++              | withFullyStaticExe lbi
++              , ghcHasFullyStatic
++              ]
++          , ghcOptLinkOptions =
+               [ "-static"
+               | withFullyStaticExe lbi
++              , not ghcHasFullyStatic
+               ]
+                 -- Pass extra `ld-options` given
+                 -- through to GHC's linker.

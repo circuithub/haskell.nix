@@ -1,35 +1,11 @@
 # Use cleanSourceWith to filter just the files needed for a particular
 # component of the package
-{ lib, cleanSourceWith }: package: component: componentName: src:
+{ lib, cleanSourceWith, normalizeRelativePath, isHpackAncestorInclude }: package: component: componentName: src:
 let
   srcStr' = src.origSrc or null;
   subDir = if src.origSubDir or "" == ""
     then ""
     else lib.removePrefix "/" src.origSubDir + "/";
-  # Remove a directory for each .. part of a path.
-  removeDotDots = parts: lib.reverseList (
-    builtins.foldl' (a: b:
-      if b == ".."
-        then builtins.tail a
-        else builtins.concatLists [ [b] a ]) [] parts);
-  # Transform
-  #  "."            -> ""
-  #  "./."          -> ""
-  #  "./xyz"        -> "xyz"
-  #  "../abc"       -> ERROR
-  #  "abc/.."       -> ""
-  #  "abc/../xyz"   -> "xyz"
-  #  "abc/./xyz"    -> "abc/xyz"
-  #  "abc/./../xyz" -> "xyz"
-  #  "abc/.././xyz" -> "xyz"
-  #  "abc/"         -> "abc/"
-  normalizeRelativePath = path:
-    let
-      # Split the path into component parts and remove the empty ones and single dots.
-      nonEmptyParts = lib.filter (x: x != "" && x != ".") (lib.splitString "/" path);
-    in lib.concatStringsSep "/" (removeDotDots nonEmptyParts)
-      # Keep the trailing slash if there was one.
-      + (if lib.hasSuffix "/" path then "/" else "");
   isAbsolutePath = path: lib.hasPrefix "/" path;
   normalizePath = path:
     (if isAbsolutePath path
@@ -46,13 +22,20 @@ let
         then a
       else a + "/" + b
     );
-  # Like normalizePath but with a trailing / when needed
+  # True if `path` is the directory `dir` or is inside it.  A bare
+  # `hasPrefix dir path` would also match siblings such as `src-gen` for
+  # `hs-source-dirs: src`.  (`dir == ""` is the root, which contains everything.)
+  isInDir = dir: path:
+    dir == "" || path == lib.removeSuffix "/" dir
+      || lib.hasPrefix (lib.removeSuffix "/" dir + "/") path;
 in
   if srcStr' == null || package.detailLevel != "FullDetails"
     then src
     else
       let
         srcStr = toString srcStr';
+        # The package directory, for `isHpackAncestorInclude`.
+        pkgDir = srcStr + lib.optionalString (subDir != "") ("/" + lib.removeSuffix "/" subDir);
         dataDir = combinePaths subDir package.dataDir;
         hsSourceDirs = builtins.map (d: combinePaths subDir d) component.hsSourceDirs
           ++ (if component.hsSourceDirs == [] then [subDir] else []);
@@ -115,12 +98,13 @@ in
                 lib.any (d: lib.strings.hasPrefix (rPath + "/") d) dirsNeeded)
               || traceReason "cabal package definition" (lib.strings.hasPrefix subDir rPath
                 && lib.strings.hasSuffix ".cabal" rPath)
-              || traceReason "hpack package definition" (lib.strings.hasPrefix subDir rPath
-                && rPath == "package.yaml")
-              || traceReason "data file" (lib.strings.hasPrefix dataDir rPath
+              || traceReason "hpack package definition" (rPath == subDir + "package.yaml")
+              || traceReason "hpack include" ((package.cleanHpack or false)
+                && isHpackAncestorInclude pkgDir path type)
+              || traceReason "data file" (isInDir dataDir rPath
                 && dataFileMatch rPath)
-              || traceReason "haskell source dir" (lib.any (d: lib.strings.hasPrefix d rPath) hsSourceDirs)
-              || traceReason "include dir" (lib.any (d: lib.strings.hasPrefix d rPath) includeDirs)
+              || traceReason "haskell source dir" (lib.any (d: isInDir d rPath) hsSourceDirs)
+              || traceReason "include dir" (lib.any (d: isInDir d rPath) includeDirs)
               || traceReason "license file" (licenseMatch rPath)
               || traceReason "extra source file" (extraSrcMatch rPath)
               || traceReason "extra doc file" (extraDocMatch rPath)

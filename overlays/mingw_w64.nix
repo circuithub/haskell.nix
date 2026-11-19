@@ -36,8 +36,6 @@ let
         # due to a too large environment.
         unset configureFlags
         unset configurePhase
-        WINEPREFIX=''${WINEPREFIX:-$(mktemp -d)}
-        REMOTE_ISERV=''${REMOTE_ISERV:-$(mktemp -d)}
         (>&2 echo "---> Starting iserv-proxy with piped ${interpreter.exeName} via wine")
         REMOTE_ISERV=$(mktemp -d)
         ln -s ${interpreter}/bin/* $REMOTE_ISERV
@@ -53,6 +51,8 @@ let
         (
         cd $REMOTE_ISERV
         for l in lib*.dll; do
+          # Skip an unmatched glob, and keep any existing `X.dll`.
+          [ -e "$l" ] && [ ! -e "''${l#lib}" ] || continue
           ln -s "$l" "''${l#lib}"
         done
         )
@@ -60,7 +60,7 @@ let
         unset pkgsHostTargetAsString
         unset LINK_DLL_FOLDERS
         WINEDLLOVERRIDES="winemac.drv=d" WINEDEBUG=warn-all,fixme-all,-menubuilder,-mscoree,-ole,-secur32,-winediag WINEPREFIX=$TMP \
-          ${iserv-proxy}/bin/iserv-proxy $@ --pipe ${lib.getExe wine} $REMOTE_ISERV/${interpreter.exeName} tmp --stdio ${no-load-call} $ISERV_ARGS
+          ${iserv-proxy}/bin/iserv-proxy "$@" --pipe ${lib.getExe wine} $REMOTE_ISERV/${interpreter.exeName} tmp --stdio ${no-load-call} $ISERV_ARGS
       '';
 
   wineIservWrapper = symlinkJoin { name = "iserv-wrapper"; paths = [ (wineIservWrapperScript false) (wineIservWrapperScript true) ]; };
@@ -96,7 +96,7 @@ let
       fi
     done
     export Path
-    ${lib.getExe wine} $@
+    ${lib.getExe wine} "$@"
   '';
   testWrapper = ["${wineTestWrapper}/bin/test-wrapper"];
 
@@ -148,8 +148,15 @@ let
         # Forward $ghc/lib/ and $ghc/share/ so `ghc --print-libdir`
         # (which makeWrapper preserves via getExecutablePath) still
         # finds the boot libs.
+        #
+        # `if`, not `[ -d ... ] && ...`: this loop is the LAST command in the
+        # builder, so with a missing directory the `&&` form left the loop's
+        # exit status at 1 and the whole derivation failed -- silently, since a
+        # failed test writes nothing.  `set -e` never fired (the test is the
+        # left operand of `&&`, which is exempt); the script simply ran off the
+        # end with a non-zero status, and the log was empty.
         for d in lib share; do
-          [ -d ${ghc}/$d ] && ln -s ${ghc}/$d $out/$d
+          if [ -d ${ghc}/$d ]; then ln -s ${ghc}/$d $out/$d; fi
         done
       '';
 

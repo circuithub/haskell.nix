@@ -29,19 +29,19 @@
     "hls-2.12" = { url = "github:haskell/haskell-language-server/2.12.0.0"; flake = false; };
     "hls"     = { url = "github:haskell/haskell-language-server"; flake = false; };
     hackage = {
-      url = "github:input-output-hk/hackage.nix";
+      url = "github:ican-group/hackage.nix";
       flake = false;
     };
     hackage-for-stackage = {
-      url = "github:input-output-hk/hackage.nix/for-stackage";
+      url = "github:ican-group/hackage.nix/for-stackage";
       flake = false;
     };
     hackage-internal = {
-      url = "github:input-output-hk/hackage.nix";
+      url = "github:ican-group/hackage.nix";
       flake = false;
     };
     stackage = {
-      url = "github:input-output-hk/stackage.nix";
+      url = "github:ican-group/stackage.nix";
       flake = false;
     };
     cabal-34 = {
@@ -72,6 +72,15 @@
       url = "github:stable-haskell/iserv-proxy?ref=iserv-syms";
       flake = false;
     };
+    # hyper-linux (`hl`, github:zw3rk/hyper-linux) runs Linux ELFs on Apple
+    # Silicon macOS via Hypervisor.framework.  It fills the qemu-user-mode slot
+    # (which doesn't exist on macOS) when cross-compiling darwin -> linux, so
+    # Template Haskell / tests can run the target binary.  This is a real flake
+    # (we want its `hl` package); keep its nixpkgs on ours.
+    hyper-linux = {
+      url = "github:zw3rk/hyper-linux";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     # head.hackage's patches, plus the tool its CI uses to turn them into a
     # package repository.  We build the repository ourselves rather than
     # downloading the published one -- see overlays/head-hackage.nix.
@@ -81,6 +90,22 @@
     };
     hackage-overlay-repo-tool = {
       url = "github:bgamari/hackage-overlay-repo-tool";
+      flake = false;
+    };
+
+    # cabal-doctest 1.0.12 (the newest release on hackage) does not build
+    # against Cabal 3.17: that release split Verbosity into VerbosityFlags and
+    # VerbosityHandles, so `buildVerbosity`'s result no longer typechecks where
+    # the Simple.Utils helpers want a Verbosity.  haskell-gi's custom Setup.hs
+    # depends on it, so the gi-gtk test needs the fixed fork.
+    #
+    # Pinned to the rev rather than the branch on purpose: the same rev is
+    # named as the `tag:` of the source-repository-package in
+    # test/gi-gtk/default.nix, and lib/call-cabal-project-to-nix.nix checks
+    # `inputMap.<url>.rev` against that tag.  Pinning keeps `nix flake update`
+    # from moving one half of that pair.
+    cabal-doctest = {
+      url = "github:stable-haskell/cabal-doctest/641cda5a4590f2384568a9598713f3039b99258d";
       flake = false;
     };
   };
@@ -110,7 +135,13 @@
       # but leaves any evaluator without darwin builders unable to evaluate
       # *anything* -- including the linux jobs.  CI on GitHub-hosted runners
       # overrides this to "x86_64-linux" (see .github/workflows/pipeline.yml).
-      evalSystem = "aarch64-darwin";
+      #
+      # Keep the `or` fallback so an IMPURE evaluation (`nix build --impure`)
+      # picks the evaluator's own system: that makes the linux jobs buildable
+      # on a machine with no darwin builders, which is how they get tested
+      # outside CI.  Pure evaluation is unaffected -- `currentSystem` is not in
+      # scope there, so it still resolves to the "aarch64-darwin" literal.
+      evalSystem = builtins.currentSystem or "aarch64-darwin";
       defaultCompiler = "ghc967";
       config = import ./config.nix;
 
@@ -157,7 +188,7 @@
         overlay = self.overlays.combined;
         overlays = import ./overlays { sources = inputs; };
 
-        # `nix flake init --template github:input-output-hk/haskell.nix`
+        # `nix flake init --template github:ican-group/haskell.nix`
         # scaffolds a new haskell.nix project (flake.nix + nix/hix.nix + a
         # `hello` package).  Kept in-repo (rather than in NixOS/templates) so
         # it stays in sync with the current `hix init` output and supported
@@ -259,6 +290,16 @@
             }
           )));
 
+        # Root-cause derivations that fail on the Apple `nix-linux-builder`
+        # VMs; see ./nix-linux-builder-failures.nix.
+        nixLinuxBuilderFailures = {
+          x86_64-linux = import ./nix-linux-builder-failures.nix {
+            haskellNix = self;
+            inherit evalSystem;
+            system = "x86_64-linux";
+          };
+        };
+
         requiredJobs = forEachSystem (system:
           let
             inherit (self.legacyPackages.${system}) releaseTools;
@@ -308,7 +349,7 @@
             # the first because the two cannot share a source tree -- the fork
             # changes the Haskell sources (Cabal2Nix, MakeInstallPlan,
             # ProjectPlanOutput, Freeze, setup-ghcjs) to suit the stable-haskell
-            # Cabal fork at 3.17, not only cabal.project.  Carrying both trees
+            # Cabal fork (3.19), not only cabal.project.  Carrying both trees
             # here, instead of keeping the fork on an unmerged branch, is what
             # lets `nix-tools-sh-*` tags be cut from master commits exactly like
             # mainline ones; see .github/workflows/upload-artifacts-sh.yml.
@@ -360,15 +401,11 @@
                 ];
               };
             shells = lib.genAttrs (
-              # Exclude old versions of GHC to speed up `nix flake check`
-              lib.attrNames (
-                lib.removeAttrs pkgs.haskell-nix.compiler
-                  ([ "ghc844" ] ++
-                    [ "ghc861" "ghc862" "ghc863" "ghc864" ] ++
-                    [ "ghc881" "ghc882" "ghc883" ] ++
-                    [ "ghc8101" "ghc8102" "ghc8103" "ghc8104" "ghc810420210212" "ghc8105" "ghc8106" ] ++
-                    [ "ghc901" ] ++ [ "ghc921" "ghc922" "ghc923" ])
-              ))
+              # Exclude compilers that are too old to be supported.  Those
+              # attributes throw (see `traceWarnOld` in overlays/bootstrap.nix),
+              # which would break `nix flake check`.
+              lib.filter (n: (builtins.tryEval pkgs.haskell-nix.compiler.${n}.version).success)
+                (lib.attrNames pkgs.haskell-nix.compiler))
               mkHaskellNixShell;
           in
           shells // { default = shells.${defaultCompiler}; });

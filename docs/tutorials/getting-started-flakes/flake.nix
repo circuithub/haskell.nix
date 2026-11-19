@@ -1,6 +1,6 @@
 {
   description = "A very basic flake";
-  inputs.haskellNix.url = "github:input-output-hk/haskell.nix";
+  inputs.haskellNix.url = "github:ican-group/haskell.nix";
   inputs.nixpkgs.follows = "haskellNix/nixpkgs-unstable";
   # nixpkgs unstable (26.11) dropped x86_64-darwin, and `eachSystem` below
   # evaluates *every* listed system to collect its output names — so one
@@ -40,8 +40,7 @@
         # This adds support for `nix build .#js-unknown-ghcjs:hello:exe:hello`
         # crossPlatforms = p: [p.ghcjs];
       };
-    in flake // {
-      # Built by `nix build .`
-      packages.default = flake.packages."hello:exe:hello";
-    });
+      # `nix build .` builds `hello:exe:hello` (`packages.default`), as
+      # `hello` is the package in the project directory.
+    in flake);
 }

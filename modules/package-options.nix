@@ -42,19 +42,21 @@
     };
 
     preCheck = lib.mkOption {
+      description = "Shell code run by a test's check before the test executable.";
       type = lib.types.nullOr haskellLib.types.uniqueStr;
       default = null;
     };
 
-    # Wrapper for test executable run in checkPhase
+    # Wrapper for the test executable run by `haskellLib.check`
     testWrapper = lib.mkOption {
       type = haskellLib.types.listOfFilteringNulls lib.types.str;
       default = [ ];
-      description = "A command to run for executing tests in checkPhase, which takes the original test command as its arguments.";
-      example = "echo";
+      description = "A command (as a list of words) that a test's check runs the test executable with, taking the test command and its arguments as its own arguments.  Used to run cross-compiled tests under an emulator.";
+      example = [ "echo" ];
     };
 
     postCheck = lib.mkOption {
+      description = "Shell code run by a test's check after the test executable has succeeded.";
       type = lib.types.nullOr haskellLib.types.uniqueStr;
       default = null;
     };
@@ -87,6 +89,18 @@
     ghcOptions = lib.mkOption {
       type = haskellLib.types.listOfFilteringNulls lib.types.str;
       default = [ ];
+    };
+
+    additional-prebuilt-depends = lib.mkOption {
+      type = lib.types.listOf lib.types.package;
+      default = [];
+      description = ''
+        Per-component additional pre-built Haskell packages to make available
+        as dependencies (adds their .conf files to this component's package DB).
+        Merged with the project-wide prebuilt-depends from cabal-project.nix.
+        Uses a different name from `prebuilt-depends` to avoid conflicting with
+        the top-level option of the same name in component-driver.nix.
+      '';
     };
 
     configureOptions = lib.mkOption {

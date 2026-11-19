@@ -106,7 +106,7 @@ in {
                 ++ onDarwin (fromUntil "9.2.0" "9.4"   ./patches/ghc/ghc-9.2-macOS-loadArchive-fix.patch)
                 ++ onDarwin (until             "9.0.2" ./patches/ghc/ghc-8.10-darwin-gcc-version-fix.patch)
 
-                # See https://github.com/input-output-hk/haskell.nix/issues/1027
+                # See https://github.com/ican-group/haskell.nix/issues/1027
                 ++ onAarch32 (until             "9.2" ./patches/ghc/ghc-8.10-3434-armv7a.patch)
                 ++ onAarch64 (until             "9.2" ./patches/ghc/ghc-8.10-3434.patch)
 
@@ -268,12 +268,14 @@ in {
                 # Hopefully this patch will not be needed for llvm 22.
                 ++ onAndroid (onAarch32 (from "9.12.3" ./patches/ghc-armv7a-android-llvm-fix.patch))
 
-                # Allow loading static external plugins into cross compilers
-                ++ onCross (fromUntil "9.6.1"  "9.11"   ./patches/ghc/5c80a27488acfe3610ddfcb99a1e961002e386d0.patch)
+                # Allow loading static external plugins into cross compilers.
+                # Not upstream in any released GHC (9.14.1 still panics in
+                # loadExternalPlugins without an internal interpreter).
+                ++ onCross (fromUntil "9.6.1"  "9.15"   ./patches/ghc/5c80a27488acfe3610ddfcb99a1e961002e386d0.patch)
                 ++ onCross (fromUntil "9.6.1"  "9.8.3"  ./patches/ghc/f8beb54a1d5725bd0d8a4b0a909d1b41d742b50b.patch)
                 ++ onCross (fromUntil "9.8.3"  "9.10"   ./patches/ghc/ghc-9.8.3-f8beb54a1d5725bd0d8a4b0a909d1b41d742b50b.patch)
                 ++ onCross (fromUntil "9.10"   "9.10.2" ./patches/ghc/f8beb54a1d5725bd0d8a4b0a909d1b41d742b50b.patch)
-                ++ onCross (fromUntil "9.10.2" "9.11"   ./patches/ghc/ghc-9.8.3-f8beb54a1d5725bd0d8a4b0a909d1b41d742b50b.patch)
+                ++ onCross (fromUntil "9.10.2" "9.15"   ./patches/ghc/ghc-9.8.3-f8beb54a1d5725bd0d8a4b0a909d1b41d742b50b.patch)
                 ++ final.lib.optionals (
                         final.stdenv.targetPlatform.isAndroid
                      && final.stdenv.targetPlatform.is32bit
@@ -303,6 +305,8 @@ in {
                 # GHC 9.6.7+, 9.8.3+, 9.10.2+ use m32 for regular sections but missed BSS and SHN_COMMON.
                 ++ onAarch64 (fromUntil "9.6.7" "9.8" ./patches/ghc/ghc-9.12-linker-use-m32-for-bss-and-common.patch)
                 ++ onAarch64 (from "9.8.3" ./patches/ghc/ghc-9.12-linker-use-m32-for-bss-and-common.patch)
+                # Provide SIMD hs_memcmp in RTS and route MO_Memcmp + Stage1+ bytestring to it on musl targets.
+                ++ onMusl (fromUntil "9.6.7" "9.8" ./patches/ghc/ghc-9.6.7-simd-memcmp.patch)
                 # these two are abit questionable. They are pretty rough, and assume static binary as well as posix.
                 # onMusl (fromUntil "9.6" "9.11" ./patches/ghc/ghc-9.6-0004-ghcidladdr.patch)
                 # onMusl (fromUntil "9.6" "9.11" ./patches/ghc/ghc-9.6-0005-Better-interpreter-debugging.-Needs-ghcidladdr.patch)
@@ -360,17 +364,48 @@ in {
                 ++ onGhcjs (fromUntil   "9.12"   "9.15"  ./patches/ghc/ghc-9.12-ghcjs-rts-mem-heap8.patch)
                 # Fix for `fatal error: 'rts/Types.h' file not found` when building `primitive`
                 ++ onGhcjs (fromUntil   "9.12.3" "9.15"  ./patches/ghc/ghc-9.13-ghcjs-rts-types.patch)
+                # Apple's ranlib (which cabal runs after `ar` on darwin build
+                # hosts) rewrites archives with 8-byte '\n' member padding
+                # counted into the size field; GHC's archive reader then hands
+                # padded wasm cbits objects to emscripten and wasm-ld fails
+                # with "section too large".  Trim the padding when extracting
+                # wasm members.
+                ++ onGhcjs (fromUntil   "9.12"   "9.15"  ./patches/ghc/ghc-9.12-js-ar-darwin-ranlib-padding.patch)
 
                 ++ onGhcjs (fromUntil   "9.6.7" "9.7"    ./patches/ghc/ghc-9.6-js-support-this-unit-id-10819.patch)
 
                 ++ onWasm (fromUntil    "9.12"  "9.12.3" ./patches/ghc/ghc-9.12-wasm-shared-libs.patch)
                 ++ onWasm (fromUntil    "9.12"  "9.12.3" ./patches/ghc/ghc-9.12-wasm-keep-cafs.patch)
+                # nixpkgs now spells the wasi32 target `wasm32-unknown-wasip1`;
+                # GHC's configure and ghc-toolchain only know the OS `wasi`.
+                ++ onWasm (from         "9.12"           ./patches/ghc/ghc-wasm-wasip1-os.patch)
 
                 # See https://github.com/IntersectMBO/plutus/issues/7415#issuecomment-3531989244
                 ++ fromUntil "9.6" "9.9" ./patches/ghc/ghc-profiling-fix.patch
 
                 # See https://gitlab.haskell.org/ghc/ghc/-/merge_requests/15096
                 ++ fromUntil "9.6" "9.12.4" ./patches/ghc/ghc-16bit-elf-section-header-overflow.patch
+                # 9.14.1 shipped without the fix (upstream has it only from 10.0).  Without it
+                # the RTS linker takes section names from whichever section is #0xffff and can
+                # run arbitrary data as a `.init` function when loading the >65280-section
+                # profiled ghc-internal object (TH segfault in aarch64-musl build-profiled).
+                ++ fromUntil "9.14" "9.15" ./patches/ghc/ghc-16bit-elf-section-header-overflow.patch
+
+                # TimerManager: registering threads publish only evaluated timeout queues.
+                # See https://gitlab.haskell.org/ghc/ghc/-/issues/9809 and
+                # https://gitlab.haskell.org/ghc/ghc/-/merge_requests/16863
+                ++ fromUntil "9.6"  "9.8"  ./patches/ghc/ghc-9.6-timer-manager-9809.patch
+                ++ fromUntil "9.8"  "9.10" ./patches/ghc/ghc-9.8-timer-manager-9809.patch
+                ++ fromUntil "9.10" "9.14" ./patches/ghc/ghc-9.10-timer-manager-9809.patch
+                ++ fromUntil "9.14" "9.15" ./patches/ghc/ghc-9.14-timer-manager-9809.patch
+                # TimerManager: on x86_64 Linux cap each backend wait at one second so a
+                # GHC running under Rosetta cannot sit in an indefinite poll after
+                # consuming a suspension request (the patch itself is CPP guarded).
+                # See https://github.com/ican-group/haskell.nix/pull/2609
+                ++ fromUntil "9.6"  "9.8"  ./patches/ghc/ghc-9.6-timer-manager-wait-cap.patch
+                ++ fromUntil "9.8"  "9.10" ./patches/ghc/ghc-9.8-timer-manager-wait-cap.patch
+                ++ fromUntil "9.10" "9.14" ./patches/ghc/ghc-9.10-timer-manager-wait-cap.patch
+                ++ fromUntil "9.14" "9.15" ./patches/ghc/ghc-9.14-timer-manager-wait-cap.patch
                 ;
         in ({
             ghc8107 = traceWarnOld "8.10" (final.callPackage ../compiler/ghc {
@@ -1356,7 +1391,7 @@ in {
                     isHaskellNixCompiler = true;
                     enableShared = false;
                     inherit (booted-ghcjs) configured-src bundled-ghcjs project;
-                    raw-src = _evalPackages: booted-ghcjs.configured-src;
+                    raw-src = booted-ghcjs.configured-src;
                     inherit booted-ghcjs buildGHC;
                     extraConfigureFlags = [
                         "--ghcjs"
@@ -1386,7 +1421,7 @@ in {
     # recursion.
     cabal-install-tool = {compiler-nix-name, ...}@args:
       (final.haskell-nix.tool compiler-nix-name "cabal" ({pkgs, ...}: {
-        evalPackages = pkgs.buildPackages;
+        evalSystem = pkgs.buildPackages.stdenv.hostPlatform.system;
         version = "3.10.3.0";
       } // args));
 

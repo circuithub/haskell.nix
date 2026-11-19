@@ -43,5 +43,28 @@
         turned on by default.
       '';
     };
+    doDefaults = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Specifies if the flake should have `packages.default` and
+        `apps.default` (for a bare `nix build` and `nix run`) when there is
+        a package in the project directory: its executable if it has
+        exactly one, and otherwise its library.  Only the flake without a
+        cross or variant prefix gets them.
+      '';
+    };
+    doHaddock = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Specifies if the flake `ciJobs` and `hydraJobs` should include a
+        `haddock` group building the documentation (`.doc`) of each
+        library/test component that has haddock enabled, so that broken
+        documentation is caught by CI (see #1932).  Packages with an empty
+        library (no exposed modules) fail with "haddock: No input file(s)";
+        set `packages.<name>.doHaddock = false` for those.
+      '';
+    };
   };
 }

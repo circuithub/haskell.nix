@@ -13,11 +13,26 @@
             "libsodium" = [ "libsodium-18" ];
           };
         };
-        libsodium-18 = (final.callPackage (haskellNix.sources.nixpkgs-2311 + "/pkgs/development/libraries/libsodium") {}).overrideAttrs (_: { dontDisableStatic = true; });
+        # The android `iserv-proxy-interpreter` is linked statically (qemu-user-mode
+        # cannot satisfy Android's dynamic loader on the build host -- see the
+        # `-optl-static` comment in `overlays/haskell.nix`), so its `dlopen` is the
+        # NDK's stub, which always fails with "libdl.a is a stub --- use libdl.so
+        # instead".  When GHC resolves a package's `extra-libraries` its RTS linker
+        # looks for a shared object BEFORE an archive, so shipping `libsodium.so`
+        # takes out every external-interpreter TH splice that touches libsodium
+        # (`th-dlls` calls `sodium_init` from one).  Build only the static library
+        # for android, as `overlays/android.nix` already does for
+        # zlib/openssl/gmp6/libffi/libiconv.
+        libsodium-18 = (final.callPackage (haskellNix.sources.nixpkgs-2311 + "/pkgs/development/libraries/libsodium") {}).overrideAttrs (old: {
+          dontDisableStatic = true;
+          configureFlags = (old.configureFlags or [])
+            ++ final.lib.optional final.stdenv.hostPlatform.isAndroid "--disable-shared";
+        });
       })
     ];
   }
 , evalPackages ? import pkgs.path nixpkgsArgs
+, evalSystem ? evalPackages.stdenv.hostPlatform.system
 , ifdLevel ? 1000
 , compiler-nix-name
 , CADerivationsEnabled ? false
@@ -163,24 +178,60 @@ let
   # testSrc = subDir: testSrcRoot + "/${subDir}";
   testSrcRootWithGitDir = evalPackages.haskell-nix.haskellLib.cleanGit { src = ../.; subDir = "test"; includeSiblings = true; keepGitDir = true; };
   testSrcWithGitDir = subDir: haskell-nix.haskellLib.cleanSourceWith { src = testSrcRootWithGitDir; inherit subDir; includeSiblings = true; };
-  headHackage = import ./head-hackage.nix { inherit evalPackages; };
+  headHackage = import ./head-hackage.nix {
+    inherit evalPackages;
+    # A stable-haskell `-target` compiler registers no target boot libraries
+    # (`emptyGlobalPackageDb`), so every project using one builds them from
+    # source with the boot-dep versions pinned by
+    # `injectStableHaskellBootPackages`.  Those pins and the ghcjs overlay's
+    # `:override` are mutually exclusive -- see head-hackage.nix.  Keyed on the
+    # capability rather than the compiler name, like the `? dwarf` guard in
+    # test/cabal-simple-debug, so the next such compiler needs no edit.
+    #
+    # Also gated on the host actually being ghcjs.  The lines this rewrites sit
+    # inside `if os(ghcjs)` blocks, so dropping them changes nothing for any
+    # other target -- but it would still change the cabal.project.local TEXT,
+    # and with it every one of those targets' plan-nix hashes, for no reason.
+    bootLibsFromSource = stdenv.hostPlatform.isGhcjs
+      && (buildPackages.haskell-nix.compiler.${compiler-nix-name}.emptyGlobalPackageDb or false);
+  };
   testCabalProjectLocal = headHackage.cabalProjectLocal;
-  testInputMap = headHackage.inputMap;
+  # inputMap entries are consulted only for `source-repository-package` urls a
+  # project actually names, so carrying the cabal-doctest fork here is inert
+  # for every test except the one that pulls it in (gi-gtk, via haskell-gi's
+  # custom Setup.hs).  It lives here rather than as a new gi-gtk argument
+  # because callPackage applies its third argument unconditionally and the
+  # tests have closed argument sets -- see the note just below.
+  #
+  # Read through `evalPackages.haskell-nix.sources` (overlays/haskell.nix
+  # re-exports the flake inputs there) rather than `haskellNix.sources`: the
+  # hydraJobs path comes via ci.nix, which does not pass `haskellNix`, so that
+  # attribute would fall back to `import ../default.nix` and die on
+  # `builtins.currentSystem` under pure eval.  plan-to-nix runs on the eval
+  # platform, which is why it is evalPackages and not pkgs.
+  testInputMap = headHackage.inputMap // {
+    "https://github.com/stable-haskell/cabal-doctest.git" =
+      evalPackages.haskell-nix.sources.cabal-doctest;
+  };
 
-  # `testCabalProjectLocal` / `testInputMap` are passed only to tests that ask
-  # for them.  callPackage's third argument is applied unconditionally, and a
-  # test with a closed argument set rejects anything it does not declare --
-  # "function 'anonymous lambda' called with unexpected argument
-  # 'testCabalProjectLocal'" -- which broke every test that does not use
-  # cabal.project.local.  The other three have always been passed to everything
-  # and every test declares them, so they stay unconditional.
+  # `evalSystem` / `testCabalProjectLocal` / `testInputMap` are passed only to
+  # tests that ask for them.  callPackage's third argument is applied
+  # unconditionally, and a test with a closed argument set rejects anything it
+  # does not declare -- "function 'anonymous lambda' called with unexpected
+  # argument 'testCabalProjectLocal'" -- which broke every test that does not
+  # use cabal.project.local.  `evalSystem` (the platform plan-to-nix runs on) is
+  # optional for the same reason: a project selects the eval platform with
+  # `evalSystem` rather than the now read-only `evalPackages` option (see
+  # modules/project-common.nix), but not every test builds a project.  The other
+  # three have always been passed to everything and every test declares them, so
+  # they stay unconditional.
   callTest = x: args:
     let
-      headHackageArgs = { inherit testCabalProjectLocal testInputMap; };
+      optionalArgs = { inherit evalSystem testCabalProjectLocal testInputMap; };
     in
     haskell-nix.callPackage x (args
       // { inherit testSrc compiler-nix-name evalPackages; }
-      // builtins.intersectAttrs (builtins.functionArgs (import x)) headHackageArgs);
+      // builtins.intersectAttrs (builtins.functionArgs (import x)) optionalArgs);
 
   # Run unit tests with: nix-instantiate --eval --strict -A unit.tests
   # An empty list means success.
@@ -196,7 +247,13 @@ let
   # All tests.
   allTests = {
     cabal-simple = callTest ./cabal-simple { inherit util; };
+    optparse-completions = callTest ./optparse-completions {};
+    cabal-files-filter = callTest ./cabal-files-filter {};
+    sdist = callTest ./sdist {};
+    cabal-project-imports = callTest ./cabal-project-imports {};
+    build-jobs = callTest ./build-jobs {};
     dummy-ghc-info = callTest ./dummy-ghc-info {};
+    dummy-ghc-pkg-dump = callTest ./dummy-ghc-pkg-dump {};
     check-datadir = callTest ./check-datadir {};
     pkgconf-pc-version = callTest ./pkgconf-pc-version {};
     cabal-simple-debug = callTest ./cabal-simple-debug { inherit util; };
@@ -211,21 +268,29 @@ let
     stack-local-resolver-subdir = callTest ./stack-local-resolver-subdir {};
     stack-remote-resolver = callTest ./stack-remote-resolver {};
     stack-symlink-yaml = callTest ./stack-symlink-yaml {};
+    stack-hpack-include = callTest ./stack-hpack-include {};
     shell-for-setup-deps = callTest ./shell-for-setup-deps {};
-    setup-deps = import ./setup-deps { inherit pkgs evalPackages compiler-nix-name testCabalProjectLocal testInputMap; };
+    setup-deps = import ./setup-deps { inherit pkgs evalPackages evalSystem compiler-nix-name testCabalProjectLocal testInputMap; };
+    setup-deps-boot-cabal = callTest ./setup-deps-boot-cabal {};
     callStackToNix = callTest ./call-stack-to-nix {};
     callCabalProjectToNix = callTest ./call-cabal-project-to-nix { inherit evalPackages; };
     cabal-source-repo = callTest ./cabal-source-repo {};
     cabal-source-repo-comments = callTest ./cabal-source-repo-comments {};
+    cabal-source-repo-symlink = callTest ./cabal-source-repo-symlink {};
     buildable = callTest ./buildable {};
     project-flags-cabal = callTest ./project-flags/cabal.nix {};
     project-flags-stack = callTest ./project-flags/stack.nix {};
     ghc-options-cabal = callTest ./ghc-options/cabal.nix {};
     ghc-options-stack = callTest ./ghc-options/stack.nix {};
+    project-packages = callTest ./project-packages {};
     exe-only = callTest ./exe-only { inherit util; };
+    build-twin-pkgconfig = callTest ./build-twin-pkgconfig {};
+    foreign-lib = callTest ./foreign-lib {};
     stack-source-repo = callTest ./stack-source-repo {};
+    stack-inputMap = callTest ./stack-inputMap { inherit testSrcRoot; };
     ghc-lib-reinstallable-cabal = callTest ./ghc-lib-reinstallable/cabal.nix {};
     ghc-lib-reinstallable-stack = callTest ./ghc-lib-reinstallable/stack.nix {};
+    generated-light = callTest ./generated-light {};
     cabal-doctests = callTest ./cabal-doctests { inherit util; };
     extra-hackage = callTest ./extra-hackage {};
     ghcjs-overlay = callTest ./ghcjs-overlay {};
@@ -240,12 +305,48 @@ let
     coverage = callTest ./coverage {};
     coverage-golden = callTest ./coverage-golden {};
     coverage-no-libs = callTest ./coverage-no-libs {};
+    v2-slice-sharing = callTest ./v2-slice-sharing {};
+    hsc2hs-patched = callTest ./hsc2hs-patched {};
     snapshots = callTest ./snapshots {};
     sublib-docs = callTest ./sublib-docs { inherit util; };
     githash = callTest ./githash { inherit compiler-nix-name evalPackages; };
     c-ffi = callTest ./c-ffi { inherit util; };
     th-dlls = callTest ./th-dlls { inherit util; };
     th-dlls-minimal = callTest ./th-dlls-minimal { inherit util; };
+    elf-comdat-functions = lib.recurseIntoAttrs {
+      # Exercise the native ELF loader once. The production fix is scoped
+      # separately to the source-built i386 musl RTS in cross projects.
+      meta.disabled = compiler-nix-name != "ghc914-sh"
+        || !stdenv.hostPlatform.isLinux
+        || !stdenv.hostPlatform.isx86_64
+        || stdenv.hostPlatform.libc != "glibc"
+        || stdenv.buildPlatform.config != stdenv.hostPlatform.config;
+      run = import ./elf-comdat-functions.nix {
+        pkgs = pkgs.pkgsBuildBuild;
+        compiler = pkgs.pkgsBuildBuild.haskell-nix.compiler.${compiler-nix-name};
+      };
+    };
+    qemu-linux-user = lib.recurseIntoAttrs {
+      # Exercise the build-host emulator once, independent of the Haskell target.
+      meta.disabled = !pkgs.pkgsBuildBuild.stdenv.hostPlatform.isLinux
+        || !pkgs.pkgsBuildBuild.stdenv.hostPlatform.isx86_64
+        || lib.versionOlder pkgs.pkgsBuildBuild.qemu.version "9.1"
+        || lib.versionAtLeast pkgs.pkgsBuildBuild.qemu.version "12";
+      run = import ./qemu-linux-user.nix { pkgs = pkgs.pkgsBuildBuild; };
+    };
+    qemu-arm32-personality = lib.recurseIntoAttrs {
+      meta.disabled = !pkgs.pkgsBuildBuild.stdenv.hostPlatform.isLinux
+        || lib.versionOlder pkgs.pkgsBuildBuild.qemu.version "9.1"
+        || lib.versionAtLeast pkgs.pkgsBuildBuild.qemu.version "12";
+      run = import ./qemu-arm32-personality.nix { pkgs = pkgs.pkgsBuildBuild; };
+    };
+    mingw-stdio = lib.recurseIntoAttrs {
+      meta.disabled = !stdenv.hostPlatform.isWindows
+        || !stdenv.hostPlatform.isx86_64
+        || !pkgs.pkgsBuildBuild.stdenv.hostPlatform.isLinux
+        || !pkgs.pkgsBuildBuild.stdenv.hostPlatform.isx86_64;
+      run = import ./mingw-stdio { inherit pkgs; };
+    };
     external-static-plugin = callTest ./external-static-plugin {};
     exe-dlls = callTest ./exe-dlls { inherit util; };
     exe-lib-dlls = callTest ./exe-lib-dlls { inherit util; };
@@ -257,6 +358,7 @@ let
     plugin = callTest ./plugin {};
     supported-languages = callTest ./supported-langauges {};
     js-template-haskell = callTest ./js-template-haskell {};
+    th-boot-only = callTest ./th-boot-only {};
     gi-gtk = callTest ./gi-gtk { inherit util; };
     literate-haskell = callTest ./literate-haskell {};
     backpack = callTest ./backpack {};

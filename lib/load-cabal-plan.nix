@@ -2,9 +2,69 @@
 {callProjectResults, selectedCompiler}:
 let
   # Read the plan.json file `plan-nix` derivation
-  plan-json = builtins.fromJSON (
+  plan-json-raw = builtins.fromJSON (
     builtins.unsafeDiscardStringContext (
       builtins.readFile (callProjectResults.projectNix + "/plan.json")));
+  # Build-machine twins under their own ids.
+  #
+  # The fork stage-qualifies every goal, but make-install-plan emits bare
+  # (unqualified) ids, so a package needed on BOTH machines appears twice
+  # under ONE id: a host unit and a build-machine unit (local packages'
+  # unhashed `pkga-0.1.0.0-inplace-pkga-exe`; on these plans hackage
+  # packages' `-inplace` ids too).  Everything downstream keys by id, so
+  # one twin used to be dropped -- the build one -- and a build tool's slice
+  # could only be found outside this plan (`hsPkgs.pkgsBuildBuild`, another
+  # plan.json), and a build-machine unit's deps resolved to HOST twins.
+  #
+  # Key each colliding build twin as `<id>:build` instead, and point every
+  # build-machine reference at it: a build unit's `depends`, every unit's
+  # `exe-depends` (build tools run on the build machine) and every `setup`
+  # component's `depends` (setup scripts do too).  Host references are
+  # unchanged.  Each twin then has its own package entry, its own slice and
+  # its own plan entry, so nothing about it comes from outside its closure.
+  # (`:` cannot occur in a cabal unit id, so the key cannot collide.)  A
+  # no-op for plans without two machines.
+  plan-json = plan-json-raw // {
+    install-plan =
+      let
+        stageOf = haskellLib.planUnitStage;
+        isConfigured = p: p.type == "configured";
+        hostIds = pkgs.lib.listToAttrs (pkgs.lib.concatMap
+          (p: pkgs.lib.optional (isConfigured p && stageOf p == "host")
+                { name = p.id; value = null; })
+          plan-json-raw.install-plan);
+        # Configured OR pre-existing: in a two-stage plan the build
+        # machine's installed boot libs are pre-existing units, and the
+        # ones registered without an `-inplace` suffix (`rts-1.0.3`,
+        # `ghc-internal-9.1400.0`, ...) share their id with the host's
+        # from-source unit.
+        isBuildTwin = p:
+          (isConfigured p || p.type == "pre-existing")
+          && stageOf p == "build" && hostIds ? ${p.id};
+        twinIds = pkgs.lib.listToAttrs (pkgs.lib.concatMap
+          (p: pkgs.lib.optional (isBuildTwin p) { name = p.id; value = null; })
+          plan-json-raw.install-plan);
+        toBuild = id: if twinIds ? ${id} then "${id}:build" else id;
+        rewriteComponents = onBuild: pkgs.lib.mapAttrs (n: c:
+          c
+          // pkgs.lib.optionalAttrs (c ? depends && (onBuild || n == "setup"))
+               { depends = map toBuild c.depends; }
+          // pkgs.lib.optionalAttrs (c ? exe-depends)
+               { exe-depends = map toBuild c.exe-depends; });
+        rewrite = p:
+          if !(isConfigured p || p.type == "pre-existing") then p
+          else let onBuild = stageOf p == "build"; in
+            p
+            // pkgs.lib.optionalAttrs (isBuildTwin p) { id = "${p.id}:build"; }
+            // pkgs.lib.optionalAttrs (p ? depends && onBuild)
+                 { depends = map toBuild p.depends; }
+            // pkgs.lib.optionalAttrs (p ? exe-depends)
+                 { exe-depends = map toBuild p.exe-depends; }
+            // pkgs.lib.optionalAttrs (p ? components)
+                 { components = rewriteComponents onBuild p.components; };
+      in if twinIds == {} then plan-json-raw.install-plan
+         else map rewrite plan-json-raw.install-plan;
+  };
   # Add context back to strings from `plan.json` that reference store paths.
   # Uses concatenation with a zero-length context string instead of
   # builtins.appendContext (which fails for store paths that don't exist locally).
@@ -13,8 +73,89 @@ let
     in if storeDirMatch == null
       then s
       else callProjectResults.rawCabalProjectContext + s;
-  # All the units in the plan indexed by unit ID.
-  by-id = pkgs.lib.listToAttrs (map (x: { name = x.id; value = x; }) plan-json.install-plan);
+  # A package can legitimately appear TWICE in the install-plan: once as a
+  # `pre-existing` unit (reported installed by the compiler / the plan-time
+  # dummy `ghc-pkg dump`) and once as a `configured` unit rebuilt from source.
+  # This happens with the stable-haskell stage2/cross projects, where boot
+  # libraries are both reported installed by the (dummy) boot compiler AND
+  # listed as local packages — cabal builds and registers the local one, so it
+  # must win.  Otherwise the pre-existing shadow makes `lookupDependency` treat
+  # the unit as pre-existing and drop it from `depends`, while the boot
+  # compiler's package DB is actually empty — Cabal-8010 "missing or private
+  # dependencies".
+  #
+  # The pre-existing shadow's id relates to the configured id in one of two
+  # ways, and both must be recognised:
+  #   * SAME id — GHC registers `rts` and `system-cxx-std-lib` without the
+  #     `-inplace` suffix, so the dummy dump mirrors that (`rts-1.0.3`).  Here
+  #     the deduped plan already keys the configured unit under that id.
+  #   * `-inplace` SUFFIX — every other boot lib is dumped as
+  #     `base-4.22.0.0-inplace` (GHC ≥ 9.8 registers in-tree boot libs with the
+  #     suffix; see the dummy-dump synthesis in call-cabal-project-to-nix.nix)
+  #     while the rebuilt local unit registers under the bare `base-4.22.0.0`.
+  #     A dependent still `depends` on the `-inplace` id, so we must both drop
+  #     the shadow AND redirect that id to the configured sibling.  The
+  #     configured boot lib is built with `--ipid=$pkgid-inplace`, so its
+  #     `package.conf.d` carries *both* `base-4.22.0.0.conf` and
+  #     `base-4.22.0.0-inplace.conf` — resolving the dependent to the
+  #     configured derivation therefore satisfies its `--dependency=base=
+  #     base-4.22.0.0-inplace` exact-configuration pin.
+  #
+  # A configured unit with a same-name-version `-inplace` pre-existing sibling
+  # only arises when a boot lib is rebuilt at its bundled version under the
+  # stable-haskell `-inplace` ipid scheme; ordinary projects never produce that
+  # pairing, so this is a no-op for them.
+  # Build-machine twins no longer share their host twin's id (see
+  # `plan-json` above), so there is nothing to drop here.
+  install-plan-staged = plan-json.install-plan;
+
+  configuredById = pkgs.lib.listToAttrs (pkgs.lib.concatMap
+    (p: pkgs.lib.optional (p.type == "configured") { name = p.id; value = p; })
+    install-plan-staged);
+  # Two-stage plans (stable-haskell `-target` cross compilers, whose target
+  # global db — and hence the plan-time dump — is EMPTY): every
+  # pre-existing unit is a BUILD-stage installed package from the native
+  # compiler's db, never a shadow of a host configured unit.  A host boot
+  # lib rebuilt from source (`base-4.22.0.0`) and the build-stage installed
+  # one (`base-4.22.0.0-inplace`) are BOTH live, for different stages —
+  # redirecting the latter to the former would hand build-stage tools a
+  # cross-target base.  Skip the dedup entirely.
+  isTwoStagePlan = selectedCompiler.emptyGlobalPackageDb or false;
+  # The configured id shadowed by a pre-existing unit `p`, or null.
+  shadowedConfiguredId = p:
+    if isTwoStagePlan then null
+    else if p.type != "pre-existing" then null
+    else if configuredById ? ${p.id} then p.id
+    else let bare = pkgs.lib.removeSuffix "-inplace" p.id;
+         in if bare != p.id && configuredById ? ${bare} then bare else null;
+  install-plan = builtins.filter (p: shadowedConfiguredId p == null)
+    install-plan-staged;
+
+  # All the units in the plan indexed by unit ID.  On top of the deduped plan,
+  # redirect each dropped `-inplace` shadow id to its configured sibling so a
+  # dependent's `depends` reference resolves to the rebuilt unit.
+  by-id = (pkgs.lib.listToAttrs (map (x: { name = x.id; value = x; }) install-plan))
+    // (pkgs.lib.listToAttrs (pkgs.lib.concatMap
+         (p: let s = shadowedConfiguredId p;
+             in pkgs.lib.optional (s != null && s != p.id)
+                  { name = p.id; value = configuredById.${s}; })
+         plan-json.install-plan));
+
+  # HOST-stage id resolution.  In a two-stage plan (stable-haskell `-target`
+  # cross compiler, whose target global db — and hence the plan-time dummy
+  # dump — is EMPTY) a pre-existing BUILD-stage boot lib and the configured
+  # HOST-stage from-source twin share one bare id (e.g. `base-4.22.0.0`;
+  # the dedup above is skipped for two-stage plans).  `by-id` is first-wins
+  # over the plan and the pre-existing entry comes first — so a HOST
+  # consumer's `depends` edge resolves to the pre-existing stub and
+  # `lookupDependency` drops it as compiler-provided, even though the
+  # target db is actually empty.  cabal then fails to solve the boot dep
+  # ("next goal: host:base … fail (backjumping)").  Prefer the configured
+  # twin for host consumers so the from-source boot slice is composed in.
+  # A pre-existing unit with NO configured twin (genuinely
+  # compiler/system-provided) is left alone, and non-two-stage plans (which
+  # dedup the shadow) are byte-identical to `by-id`.
+  by-id-host = if !isTwoStagePlan then by-id else by-id // configuredById;
 
   # Single-pass categorization via builtins.groupBy (runs in C++, O(n log k)).
   # Replaces three separate concatMap+optional filters over the full plan.
@@ -29,7 +170,7 @@ let
       else if p.type == "configured" && p.style == "local" then "local"
       else if p.type == "configured" && (p.style == "global" || p.style == "inplace") then "nonLocal"
       else throw "load-cabal-plan: unexpected install-plan entry ${p.id or "<no id>"}: type=${p.type or "<unset>"} style=${p.style or "<unset>"}"
-    ) plan-json.install-plan;
+    ) install-plan;
   in {
     preExisting = grouped.preExisting or [];
     nonLocal = grouped.nonLocal or [];
@@ -41,7 +182,7 @@ let
   # reachable through its dependency graph.  Uses Nix lazy evaluation
   # for memoization -- each entry is computed at most once.
   pre-existing-depends =
-    pkgs.lib.listToAttrs (map (p: {
+    (pkgs.lib.listToAttrs (map (p: {
       name = p.id;
       value =
         let
@@ -51,38 +192,136 @@ let
             map (dname: { name = dname; value = null; })
               (pkgs.lib.concatMap (d: builtins.attrNames pre-existing-depends.${d}) directDeps));
         in selfEntry // transitiveDeps;
-    }) plan-json.install-plan);
-  lookupPreExisting = depends:
-    pkgs.lib.concatMap (d: builtins.attrNames pre-existing-depends.${d}) depends;
-  # Lookup a dependency in `hsPkgs`
-  lookupDependency = let
+    }) install-plan))
+    # Redirect each dropped `-inplace` shadow id to its configured sibling's
+    # closure so a dependent whose raw `depends` references the `-inplace` id
+    # (which no longer keys the deduped plan) still resolves.  The configured
+    # unit isn't pre-existing, so the redirect drops the boot lib from the
+    # dependent's pre-existing set — it moves into `depends` instead.
+    // (pkgs.lib.listToAttrs (pkgs.lib.concatMap
+         (p: let s = shadowedConfiguredId p;
+             in pkgs.lib.optional (s != null && s != p.id)
+                  { name = p.id; value = pre-existing-depends.${s}; })
+         plan-json.install-plan));
+
+  # HOST-stage pre-existing closure — the counterpart to `by-id-host`.
+  # A boot lib that has a configured from-source twin is NOT
+  # compiler-provided for a host consumer, so it must stay out of the
+  # consumer's `pre-existing` set (it belongs in `depends`).  Recurse
+  # through the host-preferred unit per id so the whole boot closure
+  # resolves from source (empty pre-existing sets), while a genuinely
+  # pre-existing-only unit keeps its self entry.  Identical to
+  # `pre-existing-depends` for non-two-stage plans.
+  pre-existing-depends-host =
+    if !isTwoStagePlan then pre-existing-depends
+    else pkgs.lib.listToAttrs (map (id:
+      let p = by-id-host.${id};
+          directDeps = p.depends or p.components.lib.depends;
+          selfEntry = pkgs.lib.optionalAttrs (p.type == "pre-existing") { ${p.pkg-name} = null; };
+          transitiveDeps = pkgs.lib.listToAttrs (
+            map (dname: { name = dname; value = null; })
+              (pkgs.lib.concatMap (d: builtins.attrNames pre-existing-depends-host.${d}) directDeps));
+      in { name = id; value = selfEntry // transitiveDeps; })
+      (pkgs.lib.unique (map (p: p.id) install-plan)));
+
+  lookupPreExisting = ped: depends:
+    pkgs.lib.concatMap (d: builtins.attrNames ped.${d}) depends;
+  # Lookup a dependency in `hsPkgs`, resolving ids through `idMap`
+  # (`by-id` for build/setup scope, `by-id-host` for host library/exe
+  # scope — see `lookupDependencies`).
+  lookupDependency = idMap: let
     lookupDependency' = hsPkgs: d: let
-      instantiated-with = by-id.${d}.instantiated-with or {};
+      # `idMap` redirects a dropped `-inplace` shadow id to its configured
+      # sibling entry, so index `hsPkgs` by the sibling's real id — indexing by
+      # the raw `-inplace` id would auto-vivify an undefined module stub (its
+      # plan entry was dropped) and fail on `package.license`.
+      resolvedId = idMap.${d}.id;
+      instantiated-with = idMap.${d}.instantiated-with or {};
       instantiations = pkgs.lib.mapAttrs (_: value: value // {
         unit = lookupDependency' hsPkgs value.unit-id;
       }) instantiated-with;
-      lib-comp' = hsPkgs.${d} or hsPkgs."${by-id.${d}.pkg-name}-${by-id.${d}.pkg-version}" or hsPkgs.${by-id.${d}.pkg-name};
+      lib-comp' = hsPkgs.${resolvedId} or hsPkgs."${idMap.${d}.pkg-name}-${idMap.${d}.pkg-version}" or hsPkgs.${idMap.${d}.pkg-name};
       lib-comp = if instantiations == {} then lib-comp' else lib-comp' // {
         inherit instantiations;
       };
-      sublib-comp' = hsPkgs.${d}.components.sublibs.${pkgs.lib.removePrefix "lib:" by-id.${d}.component-name};
+      sublib-comp' = hsPkgs.${resolvedId}.components.sublibs.${pkgs.lib.removePrefix "lib:" idMap.${d}.component-name};
       sublib-comp = if instantiations == {} then sublib-comp' else sublib-comp'.override { inherit instantiations; };
-      comp = if by-id.${d}.component-name or "lib" == "lib"
+      comp = if idMap.${d}.component-name or "lib" == "lib"
              then lib-comp
              else sublib-comp;
       in comp;
   in hsPkgs: d:
-      pkgs.lib.optional (by-id.${d}.type != "pre-existing") (lookupDependency' hsPkgs d);
-  # Lookup an executable dependency in `hsPkgs.pkgsBuildBuild`
+      pkgs.lib.optional (idMap.${d}.type != "pre-existing") (lookupDependency' hsPkgs d);
+  # Lookup an executable dependency.
+  #
+  # Two-stage plans carry their build tools as BUILD-stage units of the
+  # SAME plan (built natively — comp-v2-builder gives stage:"build" units
+  # the build compiler), so the exe-depends id resolves right here in
+  # `hsPkgs`.  Single-stage cross plans predate that: their tools live in
+  # the separate `pkgsBuildBuild` (native) project, found by id or —
+  # since that project's plan differs — by name.
   lookupExeDependency = hsPkgs: d:
-    # Try to lookup by ID, but if that fails use the name (currently a different plan is used by pkgsBuildBuild when cross compiling)
-    (hsPkgs.pkgsBuildBuild.${d} or hsPkgs.pkgsBuildBuild.${by-id.${d}.pkg-name}).components.exes.${pkgs.lib.removePrefix "exe:" by-id.${d}.component-name};
+    if isTwoStagePlan
+    then (hsPkgs.${d} or hsPkgs.${by-id.${d}.pkg-name}).components.exes.${pkgs.lib.removePrefix "exe:" by-id.${d}.component-name}
+    else (hsPkgs.pkgsBuildBuild.${d} or hsPkgs.pkgsBuildBuild.${by-id.${d}.pkg-name}).components.exes.${pkgs.lib.removePrefix "exe:" by-id.${d}.component-name};
   # Populate `depends`, `pre-existing` and `build-tools`
-  lookupDependencies = hsPkgs: depends: exe-depends: {
-    depends = pkgs.lib.concatMap (lookupDependency hsPkgs) depends;
-    pre-existing = lookupPreExisting depends;
-    build-tools = map (lookupExeDependency hsPkgs) exe-depends;
+  #
+  # Two-stage plans get NO build-tools entries: their tools are
+  # BUILD-stage units the fork elaborates inplace — each consuming
+  # slice's cabal builds them itself (into the staged dist store, where
+  # composition + unit receipts let later slices reuse them).  A
+  # separate haskell.nix slice per tool would re-plan the tool
+  # single-stage and compute a different (hashed, BuildAndInstall)
+  # unit id that no consumer would ever look up.
+  # `hostStage` picks the id-resolution scope: host library/exe deps
+  # (`true`) prefer the configured from-source boot twin; setup/build
+  # deps (`false`) keep the pre-existing (build-stage, compiler-provided)
+  # boot lib.  The two differ only for two-stage cross plans — see
+  # `by-id-host` / `pre-existing-depends-host`.
+  lookupDependencies = hostStage: hsPkgs: depends: exe-depends: {
+    depends = pkgs.lib.concatMap
+      (lookupDependency (if hostStage then by-id-host else by-id) hsPkgs) depends;
+    pre-existing = lookupPreExisting
+      (if hostStage then pre-existing-depends-host else pre-existing-depends) depends;
+    build-tools =
+      pkgs.lib.optionals (!isTwoStagePlan)
+        (map (lookupExeDependency hsPkgs) exe-depends);
   };
+  # Build-machine units of a two-stage plan (#2628).  The package set's
+  # module args (`system`, `compiler`, `pkgs`, `pkgconfPkgs`) describe the
+  # HOST platform, so reading a build-machine unit's Cabal2Nix file with them
+  # answers its `os(..)`/`arch(..)` conditions for the target and resolves
+  # its system and pkg-config deps from the target's package set -- while the
+  # unit is compiled natively (comp-v2-builder's `isBuildStageUnit`) and
+  # cabal solves it for the build machine.  Swap in the build platform's
+  # answers instead, so its component config, its realized `libs` /
+  # `frameworks` / `pkgconfig`, and its `pkgconfNames` all agree with that
+  # solve.  Bound once per plan; a no-op for single-stage plans.
+  buildMachineArgs =
+    let
+      buildPkgs = pkgs.pkgsBuildBuild;
+      cabalBuild = import ./cabal-system-compiler.nix { inherit (pkgs) lib; } {
+        inherit (buildPkgs) stdenv;
+        compilerVersion = (selectedCompiler.buildGHC or selectedCompiler).version;
+      };
+    in {
+      inherit (cabalBuild) system compiler;
+      pkgs = import ./system-pkgs.nix buildPkgs;
+      pkgconfPkgs = import ./pkgconf-nixpkgs-map.nix buildPkgs;
+    };
+  argsFor = p: args:
+    if isTwoStagePlan && haskellLib.planUnitStage p == "build"
+      then args // buildMachineArgs
+      else args;
+  # The pkg-config names a package's `.cabal` file declares under the plan's
+  # flags: its Cabal2Nix term read with an empty map, so every name falls to
+  # the handler, which returns it.
+  pkgconfNamesOf = file: args: if file == null then [] else
+    pkgs.lib.concatMap pkgs.lib.concatLists (pkgs.lib.catAttrs "pkgconfig"
+      (haskellLib.getAllComponents (import file (args // {
+        hsPkgs = {}; pkgconfPkgs = {};
+        errorHandler = args.errorHandler // { pkgConfDepError = name: [ name ]; };
+      }))));
   # Calculate the packages for a component
   getComponents = cabal2nixComponents: hsPkgs: p:
     let
@@ -96,7 +335,7 @@ let
               name = pkgs.lib.removePrefix "${prefix}:" n;
               value = (if cabal2nixComponents == null then {} else cabal2nixComponents.${collectionName}.${name}) // {
                 buildable = true;
-              } // lookupDependencies hsPkgs (
+              } // lookupDependencies true hsPkgs (
                     c.depends
                     # If plan.json uses a single unit for this package (build-type: Custom),
                     # then it will leave the package itself out of `c.depends` for the
@@ -112,11 +351,19 @@ let
       // pkgs.lib.optionalAttrs (components ? lib) {
         library = (if cabal2nixComponents == null then {} else cabal2nixComponents.library) // {
           buildable = true;
-        } // lookupDependencies hsPkgs components.lib.depends components.lib.exe-depends;
+        } // lookupDependencies true hsPkgs components.lib.depends components.lib.exe-depends;
       } // pkgs.lib.optionalAttrs (components ? setup) {
         setup = {
           buildable = true;
-        } // lookupDependencies hsPkgs.pkgsBuildBuild (components.setup.depends or []) (components.setup.exe-depends or []);
+          # Setup deps run on the build machine.  In a two-stage plan they
+          # are build-stage units of THIS plan (see lookupExeDependency);
+          # otherwise they come from the pkgsBuildBuild project.  Either way
+          # they resolve in BUILD scope (`hostStage = false`): a boot lib
+          # here is the compiler-provided build-stage one, never the
+          # configured host (cross-target) twin.
+        } // lookupDependencies false
+               (if isTwoStagePlan then hsPkgs else hsPkgs.pkgsBuildBuild)
+               (components.setup.depends or []) (components.setup.exe-depends or []);
       };
   # We use unsafeDiscardStringContext to ensure that we don't query this derivation when importing
   # each package. The cost can be very high when using a remote store, as we need to do a network call.
@@ -126,33 +373,88 @@ in {
   pkgs = (hackage: {
     packages = pkgs.lib.listToAttrs (
       # Include entries for the `pre-existing` packages, but leave them as `null`
+      #
+      # Two-stage plans skip the shadow dedup above, so a BUILD-stage
+      # installed unit can share its id with a HOST configured one (the
+      # stable-haskell dummy dumps now report the same deterministic
+      # bare ids the plan elaborates for local boot libs —
+      # `Cabal-3.17.0.1` both as build-stage installed and as the local
+      # host unit).  `listToAttrs` is first-wins, so the null revision
+      # would swallow the configured entry's real definition and every
+      # consumer crashes on `src = null`.  The configured entry must
+      # own the key; the build-stage installed unit needs no package
+      # definition (it is compiler-provided).
       map (p: {
           name = p.id;
           value.revision = null;
-        }) partitioned.preExisting
+        }) (pkgs.lib.filter (p: !(configuredById ? ${p.id})) partitioned.preExisting)
       # The other packages that are not part of the project itself.
       ++ map (p: {
           name = p.id;
           value.revision =
-            {hsPkgs, ...}@args:
+            {hsPkgs, ...}@args':
               let
+                args = argsFor p args';
                 # Read the output of `Cabal2Nix.hs`.  We need it for information not
                 # in the `plan.json` file.
-                cabal2nix = (
+                file =
                   if builtins.pathExists (nixFilesDir + "/cabal-files/${p.pkg-name}.nix")
-                    then import (nixFilesDir + "/cabal-files/${p.pkg-name}.nix")
+                    then nixFilesDir + "/cabal-files/${p.pkg-name}.nix"
                   else if builtins.pathExists (nixFilesDir + "/.plan.nix/${p.pkg-name}.nix")
-                    then import (nixFilesDir + "/.plan.nix/${p.pkg-name}.nix")
+                    then nixFilesDir + "/.plan.nix/${p.pkg-name}.nix"
+                  else null;
+                cabal2nix = if file != null then import file (args // { hsPkgs = {}; })
                   else
                     # TODO make this an error?
-                    __trace "WARNING no `.nix` file for ${p.pkg-name} in ${nixFilesDir}." {}) (args // { hsPkgs = {}; });
+                    __trace "WARNING no `.nix` file for ${p.pkg-name} in ${nixFilesDir}." {};
               in pkgs.lib.optionalAttrs (p ? pkg-src-sha256) {
                 sha256 = p.pkg-src-sha256;
               } // pkgs.lib.optionalAttrs (p.pkg-src.type or "" == "source-repo") {
                 # Replace the source repository packages with versions created when
                 # parsing the `cabal.project` file.
-                src = pkgs.lib.lists.elemAt callProjectResults.sourceRepos (pkgs.lib.strings.toInt p.pkg-src.source-repo.location)
-                  + pkgs.lib.optionalString (p.pkg-src.source-repo.subdir != ".") "/${p.pkg-src.source-repo.subdir}";
+                #
+                # The package is built inside the whole repository (`origSrc`)
+                # rather than from its `subdir` alone, so relative references
+                # out of the subdir (e.g. co-log's `co-log-polysemy/LICENSE ->
+                # ../LICENSE`, #1134) still resolve.  `filterPath` is the
+                # identity because the repository is already in the store:
+                # filtering it would read the whole tree at eval time, and
+                # component cleaning would drop the targets of such symlinks.
+                src =
+                  let
+                    inherit (p.pkg-src.source-repo) location subdir;
+                    repo'' = pkgs.lib.lists.elemAt callProjectResults.sourceRepos (pkgs.lib.strings.toInt location);
+                    # An `inputMap` entry may be a plain Nix path.  The identity
+                    # `filterPath` below would leave it as a local path (not
+                    # copied to the store), so copy it here.
+                    repo' = if builtins.isPath repo''
+                      then builtins.path { path = repo''; name = "source"; }
+                      else repo'';
+                    # `src` is no longer a string, so the `apply` of the `src`
+                    # option (modules/package.nix) cannot add the store path
+                    # context the component derivations need.  Add it here.
+                    storeDirMatch = builtins.match "(${builtins.storeDir}/[^/]+).*" repo';
+                    repo =
+                      if builtins.isString repo' && builtins.getContext repo' == { } && storeDirMatch != null
+                        then builtins.appendContext repo' { ${builtins.head storeDirMatch} = { path = true; }; }
+                        else repo';
+                    # `normalizeRelativePath` cannot handle a path above the
+                    # repository root, so reject that with a clear message.
+                    escapesRepo = (builtins.foldl' (acc: x:
+                        if acc.escapes then acc
+                        else if x == ".." then { depth = acc.depth - 1; escapes = acc.depth == 0; }
+                        else { depth = acc.depth + 1; escapes = false; })
+                      { depth = 0; escapes = false; }
+                      (pkgs.lib.filter (x: x != "" && x != ".") (pkgs.lib.splitString "/" subdir))).escapes;
+                    subDir =
+                      if escapesRepo
+                        then throw "source-repository-package subdir `${subdir}` of package ${p.pkg-name} is outside the repository"
+                        else pkgs.lib.removeSuffix "/" (haskellLib.normalizeRelativePath subdir);
+                  in haskellLib.appendSubDir {
+                    src = { outPath = repo; filterPath = { path, ... }: path; };
+                    inherit subDir;
+                    includeSiblings = true;
+                  };
               } // pkgs.lib.optionalAttrs (p.pkg-src.type or "" == "repo-tar") {
                 src = pkgs.lib.mkDefault (pkgs.fetchurl {
                    # repo.uri might look like file:/nix/store/xxx; using addContext, we let nix know about the dependency on
@@ -169,6 +471,7 @@ in {
                 components = getComponents cabal2nix.components hsPkgs p;
                 package = cabal2nix.package // {
                   identifier = { name = p.pkg-name; version = p.pkg-version; id = p.id; };
+                  pkgconfNames = pkgconfNamesOf file args;
                   isProject = false;
                   setup-depends = []; # The correct setup depends will be in `components.setup.depends`
                 };
@@ -184,8 +487,10 @@ in {
       map (p: {
           name = p.id;
           value =
-            {hsPkgs, ...}@args:
-              let cabal2nix = import (nixFilesDir + "/.plan.nix/${p.pkg-name}.nix") (args // { hsPkgs = {}; });
+            {hsPkgs, ...}@args':
+              let args = argsFor p args';
+                  file = nixFilesDir + "/.plan.nix/${p.pkg-name}.nix";
+                  cabal2nix = import file (args // { hsPkgs = {}; });
               in pkgs.lib.optionalAttrs (p ? pkg-src-sha256) {
                 sha256 = p.pkg-src-sha256;
               } // pkgs.lib.optionalAttrs (p.pkg-src.type or "" == "local" && cabal2nix ? cabal-generator) {
@@ -212,6 +517,7 @@ in {
                 components = getComponents cabal2nix.components hsPkgs p;
                 package = cabal2nix.package // {
                   identifier = { name = p.pkg-name; version = p.pkg-version; id = p.id; };
+                  pkgconfNames = pkgconfNamesOf file args;
                   isProject = true;
                   setup-depends = []; # The correct setup depends will be in `components.setup.depends`
                 };

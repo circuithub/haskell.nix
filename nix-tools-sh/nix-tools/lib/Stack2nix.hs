@@ -35,7 +35,7 @@ import Cabal2Nix hiding (Git)
 import qualified Cabal2Nix as C2N
 import Cabal2Nix.Util
 
-import Stack2nix.Cache (appendCache, cacheHits)
+import NixTools.Cache (appendCache, cacheHits)
 import Stack2nix.CLI (Args(..))
 import Stack2nix.Project
 import Stack2nix.Stack (Stack(..), Dependency(..), Location(..), PackageFlags, GhcOptions)
@@ -217,13 +217,13 @@ packages2nix args pkgs =
                 prettyNix <$> cabal2nix True (argDetailLevel args) src cabalFile
               -- Only update the cache if there is not already a record
               cacheHits (argCacheFile args) url rev subdir >>= \case
-                [hit] | hit == (pkg, nix) -> return ()
+                hits | (pkg, nix) `elem` hits -> return ()
                 _ -> appendCache (argCacheFile args) url rev subdir sha256 pkg nix
               return (fromString pkg, fromString pkg $= mkPath False nix)
 
 defaultNixContents :: String
 defaultNixContents = unlines
-  [ "{ haskellNixSrc ? builtins.fetchTarball https://github.com/input-output-hk/haskell.nix/archive/master.tar.gz"
+  [ "{ haskellNixSrc ? builtins.fetchTarball https://github.com/ican-group/haskell.nix/archive/master.tar.gz"
   , "}:"
   , ""
   , "let"

@@ -15,6 +15,7 @@
 , prePatch ? component.prePatch, postPatch ? component.postPatch
 , preConfigure ? component.preConfigure, postConfigure ? component.postConfigure
 , setupBuildFlags ? component.setupBuildFlags
+, buildJobs ? component.buildJobs
 , preBuild ? component.preBuild , postBuild ? component.postBuild
 , preCheck ? component.preCheck , postCheck ? component.postCheck
 , setupInstallFlags ? component.setupInstallFlags
@@ -174,6 +175,7 @@ let self =
 , preConfigure
 , postConfigure
 , setupBuildFlags
+, buildJobs
 , preBuild
 , postBuild
 , preCheck
@@ -230,6 +232,20 @@ let
       then allComponent
       else component;
 
+  # The `-jN` flag the component asked for, as a (possibly empty) list so that
+  # an unset `buildJobs` contributes nothing at all to the `Setup build`
+  # command line (keeping the generated build phase byte-identical).  See #1479.
+  buildJobsFlags = lib.optional (buildJobs != null) "-j${toString buildJobs}";
+
+  # The `-jN` flag passed to `Setup build` on the normal (non content-addressed,
+  # non-ghcjs) path.  When `buildJobs` is null we keep the historical default
+  # (`-j` capped at min(NIX_BUILD_CORES, 4)); otherwise the component pins the
+  # job count (e.g. `buildJobs = 1` for a sequential, low-memory build).
+  buildJobsFlag =
+    if buildJobs == null
+      then "-j$(($NIX_BUILD_CORES > 4 ? 4 : $NIX_BUILD_CORES))"
+      else lib.head buildJobsFlags;
+
   # Ignore attempts to include DWARF info when it is not possible
   enableDWARF = drvArgs.enableDWARF or false
     && stdenv.hostPlatform.isLinux
@@ -254,16 +270,23 @@ let
     then haskellLib.cleanCabalComponent package componentForSetup "${componentId.ctype}-${componentId.cname}" src
     else
       # We can clean out the siblings though to at least avoid changes to other packages
-      # from triggering a rebuild of this one.
-      # Passing `subDir` but not `includeSiblings = true;` will exclude anything not
-      # in the `subDir`.
+      # from triggering a rebuild of this one.  Outside the package directory
+      # keep only the YAML files in its ancestor directories: a `package.yaml`
+      # may `!include` (or take `defaults: local:` from) a file such as
+      # `../common.yaml` shared by several packages, and hpack runs in this
+      # source (#485).
       if src ? origSrc && src ? filter && src.origSubDir or "" != ""
-        then haskellLib.cleanSourceWith {
-          name = src.name or "source";
-          src = src.origSrc;
-          subDir = lib.removePrefix "/" src.origSubDir;
-          inherit (src) filter;
-        }
+        then
+          let pkgDir = toString src.origSrc + src.origSubDir;
+          in haskellLib.cleanSourceWith {
+            name = src.name or "source";
+            src = src.origSrc;
+            subDir = lib.removePrefix "/" src.origSubDir;
+            includeSiblings = true;
+            filter = path: type: src.filter path type && (
+              lib.hasPrefix (pkgDir + "/") path
+              || haskellLib.isHpackAncestorInclude pkgDir path type);
+          }
         else src);
 
   nameOnly = "${package.identifier.name}-${componentId.ctype}-${componentId.cname}";
@@ -275,7 +298,10 @@ let
   configFiles = makeConfigFiles {
     component = componentForSetup;
     inherit (package) identifier;
-    inherit fullName flags needsProfiling enableDWARF prebuilt-depends instantiations;
+    inherit fullName flags needsProfiling enableDWARF instantiations;
+    # Merge the global (project-level) prebuilt-depends with any per-component
+    # additional-prebuilt-depends set via the modules system (package-options.nix).
+    prebuilt-depends = prebuilt-depends ++ (component.additional-prebuilt-depends or []);
   };
 
   enableFeature = enable: feature:
@@ -341,9 +367,9 @@ let
       # GHC
       "--with-ghc=${ghc.targetPrefix}ghc"
       "--with-ghc-pkg=${ghc.targetPrefix}ghc-pkg"
-      "--with-hsc2hs=${ghc.targetPrefix}hsc2hs"
+      "--with-hsc2hs=${hsc2hsCommand}"
     ] ++ lib.optional (pkgconfig != [])
-      "--with-pkg-config=${buildPackages.cabalPkgConfigWrapper.targetPrefix}pkg-config"
+      "--with-pkg-config=${buildPackages.cabalPkgConfigWrapperReal.targetPrefix}pkg-config"
       ++ lib.optionals (stdenv.hasCC or (stdenv.cc != null))
     ( # CC
       [ "--with-gcc=${stdenv.cc.targetPrefix}cc"
@@ -417,7 +443,33 @@ let
           && builtins.compareVersions defaults.ghc.version "9.3" < 0)
         "--ghc-options=-j1";
 
-  # the build-tools version might be depending on the version of the package, similarly to patches
+  # The build-tools, with any version-dependent ones resolved for this
+  # package's version (similarly to patches).
+  resolvedBuildTools = map
+    (p: if builtins.isFunction p
+      then p { inherit (package.identifier) version; }
+      else p) build-tools;
+
+  # The hsc2hs to run.  Normally the compiler's, which is first in PATH
+  # anyway (so hsc2hs is never wanted from build-tools, see below).  The
+  # exception is a cross build whose plan chose haskell.nix's patched hsc2hs
+  # (overlays/hsc2hs.nix, `usePatchedHsc2hs`): that one computes all of a
+  # file's constants in a single C compilation instead of several per
+  # constant.  Not for native builds, where hsc2hs runs a test program
+  # directly and the patched one has nothing to add, so they need not
+  # build it.
+  planHsc2hs = lib.findFirst (x: x != null
+      && x.identifier.name or "" == "hsc2hs"
+      && x.identifier.version or "" == buildPackages.haskell-nix.hsc2hs-patched-version)
+    null resolvedBuildTools;
+  hsc2hsCommand =
+    if haskellLib.isCrossHost && planHsc2hs != null
+      # A build tool is either the package or the exe component itself.
+      then "${if planHsc2hs.isHaskell or false
+                then planHsc2hs.components.exes.hsc2hs
+                else planHsc2hs}/bin/hsc2hs"
+      else "${ghc.targetPrefix}hsc2hs";
+
   executableToolDepends =
     (lib.concatMap (c: if c.isHaskell or false
       then builtins.attrValues (c.components.exes or {})
@@ -425,12 +477,10 @@ let
       (builtins.filter (x: x != null
         # We always exclude hsc2hs from build-tools because it is unecessary as it is provided by ghc
         # and hsc2hs from ghc is first in PATH so the one from build-tools is never used.
+        # (The patched one, when used, is passed by path as `--with-hsc2hs`.)
         && x.identifier.name or "" != "hsc2hs")
-      (map
-        (p: if builtins.isFunction p
-          then p { inherit  (package.identifier) version; }
-          else p) build-tools))) ++
-    lib.optional (pkgconfig != []) buildPackages.cabalPkgConfigWrapper;
+      resolvedBuildTools)) ++
+    lib.optional (pkgconfig != []) buildPackages.cabalPkgConfigWrapperReal;
 
   # Unfortunately, we need to wrap ghc commands for cabal builds to
   # work in the nix-shell. See ../docs/dev/removing-with-package-wrapper.md.
@@ -583,13 +633,19 @@ let
       # for gi-gtk-hs it seems to help.
       ++ haskellLib.uniqueWithName (map pkgs.lib.getDev (builtins.concatLists pkgconfig))
       # These only need to be propagated for library components (otherwise they
-      # will be in `buildInputs`)
-      ++ lib.optionals (haskellLib.isLibrary componentId) configFiles.libDeps # libDeps is already deduplicated
+      # will be in `buildInputs`).  Use regularLibDeps (without prebuilt-depends)
+      # to prevent prebuilt-depends from leaking into the setup package DBs of
+      # downstream packages that depend on this library.
+      ++ lib.optionals (haskellLib.isLibrary componentId) configFiles.regularLibDeps
       ++ lib.optionals stdenv.hostPlatform.isWindows
         (haskellLib.uniqueWithName (lib.flatten component.libs)));
 
     buildInputs = haskellLib.checkUnique "${ghc.targetPrefix}${fullName} buildInputs" (
       lib.optionals (!haskellLib.isLibrary componentId) configFiles.libDeps # libDeps is already deduplicated
+      # For library components, prebuilt-depends must be in buildInputs (not
+      # propagatedBuildInputs) so they are available in pkgsHostTarget for the
+      # inline config-files script but do NOT leak to downstream packages.
+      ++ lib.optionals (haskellLib.isLibrary componentId) (configFiles."prebuilt-depends" or [])
       ++ lib.optionals (!stdenv.hostPlatform.isWindows)
         (haskellLib.uniqueWithName (lib.flatten component.libs)));
 
@@ -695,19 +751,27 @@ let
       # in order to have a deterministic output and therefore avoid potential situations
       # where the binary cache becomes useless
       # See also https://gitlab.haskell.org/ghc/ghc/-/issues/12935
+      #
+      # This overrides `buildJobs` on purpose: determinism of the output is
+      # what makes `__contentAddressed` useful, so a component may not ask for
+      # more parallelism here.  `buildJobs = 1` is what this path does anyway.
       (if contentAddressed then ''
         runHook preBuild
         $SETUP_HS build ${haskellLib.componentTarget componentId} -j1 ${lib.concatStringsSep " " setupBuildFlags}
         runHook postBuild
-      '' else if stdenv.hostPlatform.isGhcjs then ''
+      ''
+      # The ghcjs path historically passes no `-j` at all.  Honour `buildJobs`
+      # when it is set explicitly (so a memory-hungry ghcjs component can still
+      # be pinned to `-j1`) but keep passing nothing by default.
+      else if stdenv.hostPlatform.isGhcjs then ''
         runHook preBuild
         # https://gitlab.haskell.org/ghc/ghc/issues/9221
-        $SETUP_HS build ${haskellLib.componentTarget componentId} ${lib.concatStringsSep " " setupBuildFlags}
+        $SETUP_HS build ${haskellLib.componentTarget componentId} ${lib.concatStringsSep " " (buildJobsFlags ++ setupBuildFlags)}
         runHook postBuild
       '' else ''
         runHook preBuild
         # https://gitlab.haskell.org/ghc/ghc/issues/9221
-        $SETUP_HS build ${haskellLib.componentTarget componentId} -j$(($NIX_BUILD_CORES > 4 ? 4 : $NIX_BUILD_CORES)) ${lib.concatStringsSep " " setupBuildFlags}
+        $SETUP_HS build ${haskellLib.componentTarget componentId} ${buildJobsFlag} ${lib.concatStringsSep " " setupBuildFlags}
         runHook postBuild
       '');
 
@@ -813,6 +877,18 @@ let
           ''}
         fi
       '')
+      # On darwin a foreign library finds its Haskell dependencies through
+      # an rpath to `$configFiles/lib/links` (see make-config-files.nix),
+      # which is a temporary directory unless `keepConfigFiles` is set.
+      # Install those links next to the library and point the rpath there.
+      + (lib.optionalString (stdenv.hostPlatform.isDarwin && componentId.ctype == "flib") ''
+        mkdir -p $out/lib/links
+        cp -P $configFiles/lib/links/*.dylib $out/lib/links/
+        for f in $out/lib/*.dylib; do
+          ${stdenv.cc.bintools.targetPrefix}install_name_tool \
+            -rpath $configFiles/lib/links $out/lib/links "$f"
+        done
+      '')
       # In case `setup copy` did not create this
       + (lib.optionalString enableSeparateDataOutput ''
          mkdir -p $data
@@ -889,14 +965,24 @@ let
     '');
 
     doInstallCheck = true;
-    installCheckPhase = lib.optionalString (haskellLib.isLibrary componentId) ''
-      if test -n "$(shopt -s nullglob; echo $out/package.conf.d/${name}-*.conf)"; then
-          echo $out/package.conf.d/${name}-*.conf " is present"
+    installCheckPhase = lib.optionalString (haskellLib.isLibrary componentId) (
+      let
+        # The registered id is normally `<pkgid>-<hash>[-<sublib>]`, but an
+        # explicit `--ipid` (e.g. the stable-haskell stage2 boot libraries'
+        # `--ipid=$pkgid`) can register under the bare `<pkgid>.conf`.  Only
+        # widen the glob for components that pass --ipid, so everything else
+        # keeps its derivation hash.
+        hasIpid = lib.any (lib.hasPrefix "--ipid") configureFlags;
+        confGlob = "$out/package.conf.d/${name}-*.conf"
+          + lib.optionalString hasIpid " $out/package.conf.d/${name}.conf";
+      in ''
+      if test -n "$(shopt -s nullglob; echo ${confGlob})"; then
+          echo ${confGlob} " is present"
       else
-        echo "ERROR: $out/package.conf.d/${name}-*.conf was not created"
+        echo "ERROR: ${confGlob} was not created"
         exit 1
       fi
-    '';
+    '');
 
     shellHook = ''
       export PATH=$ghc/bin:$PATH
@@ -931,6 +1017,7 @@ in drv; in self) {
           preConfigure
           postConfigure
           setupBuildFlags
+          buildJobs
           preBuild
           postBuild
           preCheck

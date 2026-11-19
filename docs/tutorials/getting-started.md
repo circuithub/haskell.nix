@@ -49,9 +49,9 @@ This can be tricky to get setup properly. If you're still having trouble getting
 This section assumes you choose to uses the experimental flakes features, and so that you have added `experimental-features = [ "nix-command" "flakes" ];` in your Nix configuration. You can look at [the Wiki](https://nixos.wiki/wiki/Flakes) for more instructions.
 
 The following `nix flake init` command creates a template `hello` package containing a `flake.nix` and `nix/hix.nix` file. The project can be used with
-regular `nix` tools. This template is defined in the [haskell.nix repository](https://github.com/input-output-hk/haskell.nix/tree/master/templates/haskell-nix), so it always matches the current `hix init` output and supported GHC versions.
+regular `nix` tools. This template is defined in the [haskell.nix repository](https://github.com/ican-group/haskell.nix/tree/master/templates/haskell-nix), so it always matches the current `hix init` output and supported GHC versions.
 ```bash
-nix flake init --template github:input-output-hk/haskell.nix
+nix flake init --template github:ican-group/haskell.nix
 nix develop
 cabal build
 ```
@@ -101,6 +101,22 @@ To build an executable:
 nix build .#your-package-name:exe:your-exe-name
 ```
 
+Building a test component (`your-package-name:test:your-test-name`) only
+compiles the test. To run it, build its check, or run all of them with
+`nix flake check`
+(see [Running tests](./testing.md)). Replace `x86_64-linux` with your system:
+```shell
+nix build '.#checks.x86_64-linux."your-package-name:test:your-test-name"'
+```
+
+When the project directory (the one with `cabal.project` or `stack.yaml`)
+is itself the directory of a package, the flake also has a `default`
+package and app taken from that package, the one a bare `cabal build` or
+`cabal run` would use there.  `nix build` builds the package's executable
+if it has exactly one, and its library otherwise; `nix run` runs that
+executable.  Set `flake.doDefaults = false` in the project to leave them
+out.
+
 Flakes provide a `devShell` attribute that allow you to spawn a developer shell, here with `cabal`, `hlint` and `haskell-language-server`:
 ```shell
 nix develop .
@@ -108,7 +124,7 @@ cabal repl your-package-name:lib:your-package-name
 cabal build your-package-name
 ```
 
-To open a shell for use with `stack` see [the following issue](https://github.com/input-output-hk/haskell.nix/issues/689#issuecomment-643832619).
+To open a shell for use with `stack` see [the following issue](https://github.com/ican-group/haskell.nix/issues/689#issuecomment-643832619).
 
 ## Getting started with Hix
 
@@ -120,7 +136,7 @@ For instance to run `cabal build` on the `hello` package from hackage:
 ```shell
 cabal unpack hello
 cd hello-1.0.0.2
-nix run "github:input-output-hk/haskell.nix#hix" -- init
+nix run "github:ican-group/haskell.nix#hix" -- init
 nix develop
 cabal build
 ```
@@ -144,7 +160,7 @@ nix run .#hello:exe:hello
 
 To use the other Hix features first install Hix with:
 ```shell
-nix-env -iA hix -f https://github.com/input-output-hk/haskell.nix/tarball/master
+nix-env -iA hix -f https://github.com/ican-group/haskell.nix/tarball/master
 ```
 
 To update run to the latest version run:

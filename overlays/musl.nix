@@ -24,6 +24,14 @@ final: prev: prev.lib.optionalAttrs prev.stdenv.hostPlatform.isMusl ({
   zstd = prev.zstd.override { static = true; };
   xz = prev.xz.override { enableStatic = true; };
   lzma = prev.lzma.override { enableStatic = true; };
+  # systemd (262) dlopen()s its compression libraries and records them in
+  # ELF `.note.dlopen` notes, which its autoPatchelfHook resolves, so it needs
+  # their shared objects:
+  #   could not satisfy dependency liblzma.so.5 / libzstd.so.1 wanted by .../libsystemd.so.0
+  # Give it nixpkgs' shared xz and zstd rather than the static-only ones
+  # above.  systemdMinimal and systemdLibs are `systemd.override`s, so they
+  # inherit this.
+  systemd = prev.systemd.override { inherit (prev) xz zstd; };
   pcre = prev.pcre.overrideAttrs (_: { dontDisableStatic = true; });
   secp256k1 = prev.secp256k1.overrideAttrs (oldAttrs: {
     configureFlags = oldAttrs.configureFlags ++ ["--enable-static"];
@@ -33,7 +41,7 @@ final: prev: prev.lib.optionalAttrs prev.stdenv.hostPlatform.isMusl ({
     configureFlags = (oldAttrs.configureFlags or []) ++ ["--enable-static"];
   });
 
-  # See https://github.com/input-output-hk/haskell.nix/issues/948
+  # See https://github.com/ican-group/haskell.nix/issues/948
   postgresql = (prev.postgresql.overrideAttrs (_old: {
       dontDisableStatic = true;
       # the following is needed because libicu links against stdc++
@@ -59,6 +67,19 @@ final: prev: prev.lib.optionalAttrs prev.stdenv.hostPlatform.isMusl ({
   nix = prev.nix.overrideAttrs (_: { doInstallCheck = false; });
   # Cross-compiled test binaries can't run on the build host
   libffi = prev.libffi.overrideAttrs (_: prev.lib.optionalAttrs (prev.stdenv.hostPlatform != prev.stdenv.buildPlatform) { doCheck = false; });
+
+  # Arch-optimized SIMD memcmp for musl (replaces the generic byte loop).
+  # The per-arch sources live next to this overlay and are copied into the
+  # musl tree before build, where the Makefile ARCH_GLOBS pick them up and
+  # the arch object replaces the generic one. Gated to the architectures
+  # we ship sources for.
+  musl = prev.musl.overrideAttrs (old: prev.lib.optionalAttrs (prev.stdenv.hostPlatform.isx86_64 || (prev.stdenv.hostPlatform.isAarch64 && prev.stdenv.hostPlatform.isLittleEndian)) {
+    postPatch = (old.postPatch or "") + prev.lib.optionalString prev.stdenv.hostPlatform.isx86_64 ''
+      cp ${./patches/musl/memcmp-x86_64.s} src/string/x86_64/memcmp.s
+    '' + prev.lib.optionalString (prev.stdenv.hostPlatform.isAarch64 && prev.stdenv.hostPlatform.isLittleEndian) ''
+      cp ${./patches/musl/memcmp-aarch64.S} src/string/aarch64/memcmp.S
+    '';
+  });
 } // prev.lib.optionalAttrs (prev.lib.versionAtLeast prev.lib.trivial.release "20.03") {
   # Fix infinite recursion between openssh and fetchcvs
   openssh = prev.openssh.override { withFIDO = false; };

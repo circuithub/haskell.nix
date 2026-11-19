@@ -4,6 +4,31 @@ with lib;
 with types;
 
 let
+  # Each definition of `localPackages`/`projectPackages` (or each element of a
+  # list given as one) is kept, with the file it came from, so that it can be
+  # imported (conditionally) into each package's submodule, where the usual
+  # merging (and `mkForce` etc.) happens and errors point at that file.
+  packageConfigs = mkOptionType {
+    name = "packageConfigs";
+    description = "package options (as for packages.<name>), or a module function returning them";
+    check = x: isAttrs x || isFunction x
+      || isList x && all (y: isAttrs y || isFunction y) x;
+    merge = _loc: defs: concatMap
+      (d: map (value: { inherit (d) file; inherit value; }) (toList d.value))
+      defs;
+    emptyValue = { value = []; };
+  };
+
+  # A module applying the definition `d` to a package when `cond` holds for
+  # the package's config.  A function definition is given the module
+  # arguments it asks for (`pkgs`, `hsPkgs`, ...) like any module.
+  packageConfigIf = cond: d: setDefaultModuleLocation d.file (
+    if isFunction d.value
+      then setFunctionArgs
+        (args: { config = mkIf (cond args.config) (d.value args); })
+        (functionArgs d.value // { config = false; })
+      else { config, ... }: { config = mkIf (cond config) d.value; });
+
   package = submodule [
     {
       _module.args = {
@@ -15,6 +40,13 @@ let
     ./package.nix
     # pass down common options as default values
     ({ lib, options, ... }: lib.mkDefault (lib.filterAttrs (n: _v: builtins.hasAttr n options) config))
+    # `localPackages` and `projectPackages` (see below).  Nothing is imported
+    # (and `isLocal`/`isProject` is not looked at) unless they are used.
+    {
+      imports =
+           map (packageConfigIf (c: c.package.isLocal)) config.localPackages
+        ++ map (packageConfigIf (c: c.package.isProject)) config.projectPackages;
+    }
   ];
 
 in
@@ -31,6 +63,30 @@ in
   options = {
     plan-json = mkOption {
       type = attrsOf unspecified;
+    };
+    localPackages = mkOption {
+      type = packageConfigs;
+      default = [];
+      description = ''
+        Package options applied to every package with `package.isLocal` set:
+        the project's own packages and those from `source-repository-package`
+        stanzas (or `extra-deps` with a git/local location for stack).  For
+        example `localPackages = { doHaddock = false; };`.  It may also be a
+        module function (taking `config`, `lib`, `pkgs`, ... of the package),
+        as long as it does not decide which options to set from the
+        package's `config`, or a list of these.
+      '';
+    };
+    projectPackages = mkOption {
+      type = packageConfigs;
+      default = [];
+      description = ''
+        Like `localPackages`, but only for packages with `package.isProject`
+        set: the project's own packages, not those from
+        `source-repository-package` stanzas.  For example, to build them with
+        `-Werror` (only in the Nix build, not when using `cabal` in a shell):
+        `projectPackages = { ghcOptions = [ "-Werror" ]; };`.
+      '';
     };
     use-package-keys = mkOption {
       type = bool;
@@ -61,9 +117,15 @@ in
       type = attrsOf unspecified;
       default = {};
     };
-    # Project-global data the v2 builder derives once from the install
-    # plan (`projectConfigPragmas`, the doc-enabled package set and the
-    # source-repo flag map).  Computed in
+    # The same index preferring the fork's BUILD-stage twins on id
+    # collisions (setup scopes are build-stage; see
+    # modules/install-plan/override-package-by-name.nix).
+    plan-json-by-id-build = mkOption {
+      type = attrsOf unspecified;
+      default = {};
+    };
+    # Data the v2 builder derives once per project (the configure-args
+    # translation and the doc-enabled package set).  Computed in
     # `modules/install-plan/override-package-by-name.nix` and shared
     # across all slices so the v2 builder doesn't re-scan the whole plan
     # (and re-run the configure-arg regexes) once per component.

@@ -81,6 +81,18 @@ let
           prev.haskell-nix // {
             inherit (nix-tools-pkgs) nix-tools nix-tools-set;
             # either nix-tools from its overlay or from the tarball.
+            #
+            # Keep these prebuilt bundles.  plan-nix is the universal IFD, so a
+            # from-source nix-tools turns one prebuilt bundle into three
+            # per-component builds in every plan-nix derivation across the
+            # whole compiler x platform matrix -- measured at 6x-89x the
+            # per-job eval time on the mainline compilers (ghc967 124.8s/job
+            # vs 1.4s).
+            #
+            # v2 projects (and every stable-haskell compiler's) plan with
+            # `nix-tools-unchecked-sh`, the stable-haskell cabal fork, to match
+            # the v2 builder's cabal; v1 projects keep this mainline 3.16
+            # bundle.  See modules/cabal-project.nix.
             nix-tools-unchecked = static-nix-tools // {
               exes =  static-nix-tools.exes // {
                 inherit (static-nix-tools-for-default-setup.exes) default-setup default-setup-ghcjs;
@@ -106,9 +118,12 @@ let
     compiler-llvm = import ./compiler-llvm.nix;
     ghc-packages = import ./ghc-packages.nix;
     darwin = import ./darwin.nix;
+    mingw-stdio = import ./mingw-stdio.nix;
     windows = import ./windows.nix;
     armv6l-linux = import ./armv6l-linux.nix;
+    hyper-linux = import ./hyper-linux.nix { inherit sources; };
     musl = import ./musl.nix;
+    cross-checks = import ./cross-checks.nix;
     android = import ./android.nix;
     tools = import ./tools.nix;
     emscripten = import ./emscripten.nix;
@@ -121,6 +136,8 @@ let
     lazy-inputs = import ../lazy-inputs;
     rcodesign = import ./rcodesign.nix;
     wasm = import ./wasm.nix;
+    stable-haskell = import ./stable-haskell.nix;
+    hsc2hs = import ./hsc2hs.nix;
   };
 
   composeExtensions = f: g: final: prev:
@@ -144,9 +161,12 @@ let
     compiler-llvm
     ghc-packages
     darwin
+    mingw-stdio
     windows
     armv6l-linux
+    hyper-linux
     musl
+    cross-checks
     android
     tools
     head-hackage
@@ -159,8 +179,11 @@ let
     wasm
     # Restore nixpkgs haskell and haskellPackages
     (_: prev: { inherit (prev.haskell-nix-prev) haskell haskellPackages; })
-    cacheCompilerDeps
     lazy-inputs
+    # After lazy-inputs (its source), before stable-haskell (a user of it).
+    hsc2hs
+    stable-haskell
+    cacheCompilerDeps
     rcodesign
   ];
   combined = builtins.foldl' composeExtensions (_: _: { }) ordered;

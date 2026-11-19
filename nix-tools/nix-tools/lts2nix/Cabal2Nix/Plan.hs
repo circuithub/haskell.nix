@@ -4,11 +4,15 @@
 module Cabal2Nix.Plan
 where
 
-import           Cabal2Nix.Util                           ( quoted
+import           Cabal2Nix.Util                           ( attrName
+                                                          , quoted
                                                           , bindPath
+                                                          , hackageVersion
+                                                          , hackageVersionHelper
                                                           )
 import           Data.HashMap.Strict                      ( HashMap )
 import qualified Data.HashMap.Strict           as Map
+import           Data.Coerce                              ( coerce )
 import           Data.List.NonEmpty                       ( NonEmpty (..) )
 import           Data.Text                                ( Text )
 import qualified Data.Text                     as Text
@@ -32,6 +36,9 @@ data Package = Package
 plan2nix :: Plan -> NExpr
 plan2nix (Plan { packages, compilerVersion, compilerPackages }) =
   mkFunction "hackage"
+    -- Bind the shared hackage.nix lookup guard once per file (it references the
+    -- `hackage` function argument, so it must live inside this lambda).
+    . mkLets [ hackageVersionHelper ]
     . mkNonRecSet
     $ [ "packages" $= (mkNonRecSet $ uncurry bind =<< Map.toList quotedPackages)
       , "compiler" $= mkNonRecSet
@@ -44,10 +51,10 @@ plan2nix (Plan { packages, compilerVersion, compilerPackages }) =
   quotedPackages = mapKeys quoted packages
   bind :: Text -> Maybe Package -> [Binding NExpr]
   bind pkg (Just (Package { packageVersion, packageRevision, packageFlags })) =
-    let verExpr      = (mkSym "hackage" @. pkg) @. quoted packageVersion
-        revExpr      = (verExpr @. "revisions") @. maybe "default" quoted packageRevision
+    let revExpr      = hackageVersion (Text.dropAround (== '"') pkg) packageVersion
+                                      (maybe "default" id packageRevision)
         flagBindings = Map.foldrWithKey
-          (\fname val acc -> bindPath (VarName pkg :| ["flags", fname]) (mkBool val) : acc)
+          (\fname val acc -> bindPath (VarName pkg :| ["flags", VarName (attrName (coerce fname))]) (mkBool val) : acc)
           []
           packageFlags
     in  revBinding pkg revExpr : flagBindings

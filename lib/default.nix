@@ -99,16 +99,42 @@ in {
     || isBenchmark componentId;
   mayHaveExecutable = isExecutableType;
 
+  # Names in `nonReinstallablePkgs` that a project pins to a version other than
+  # the one shipped with the compiler.  Such overrides are silently dropped by
+  # the `nonReinstallablePkgs` shadow in `config.hsPkgs`, so callers warn about
+  # them rather than letting the build fail later with an opaque
+  # `installed package ... is broken due to missing package X-<ver>` error
+  # (see #1657).  `packages` maps a package name to its module config (or null,
+  # for a shadowed entry); `compilerPackages` maps a name to the version string
+  # the compiler ships.  Only packages actually pinned to a differing version
+  # are returned, so a normal project yields `[]`.
+  shadowedNonReinstallablePkgs = { nonReinstallablePkgs, packages, compilerPackages }:
+    lib.filter (name:
+         packages ? ${name}
+      && packages.${name} != null
+      # A `packages.<name>` record that only carries by-name overrides has
+      # no `package.identifier` (see `hasPackageDefinition` in
+      # modules/package.nix); reading its version would throw.
+      && (packages.${name}.hasPackageDefinition or true)
+      && compilerPackages ? ${name}
+      && (packages.${name}.package.identifier.version or null) != null
+      && packages.${name}.package.identifier.version != compilerPackages.${name}
+    ) nonReinstallablePkgs;
+
   # Was there a reference to the package source in the `cabal.project` or `stack.yaml` file.
   # This is used to make the default `packages` list for `shellFor`.
   isLocalPackage = p: p.isLocal or false;
   isRedirectPackage = p: p.isRedirect or false;
-  selectLocalPackages = lib.filterAttrs (_n: p: p != null && isLocalPackage p && !isRedirectPackage p);
+  # A build-machine twin (`<id>:build`, lib/load-cabal-plan.nix) is the
+  # build machine's copy of a package, not a package of the project: leave it
+  # out of project-wide selections (coverage reports, shells, ...).
+  isBuildTwinKey = n: lib.hasSuffix ":build" n;
+  selectLocalPackages = lib.filterAttrs (n: p: p != null && isLocalPackage p && !isRedirectPackage p && !isBuildTwinKey n);
 
   # if it's a project package it has a src attribute set with an origSubDir attribute.
   # project packages are a subset of localPackages
   isProjectPackage = p: p.isProject or false;
-  selectProjectPackages = lib.filterAttrs (_n: p: p != null && isLocalPackage p && isProjectPackage p && !isRedirectPackage p);
+  selectProjectPackages = lib.filterAttrs (n: p: p != null && isLocalPackage p && isProjectPackage p && !isRedirectPackage p && !isBuildTwinKey n);
 
   # Format a componentId as it should appear as a target on the
   # command line of the setup script.
@@ -206,9 +232,50 @@ in {
   # Replacement for lib.cleanSourceWith that has a subDir argument.
   inherit (import ./clean-source-with.nix { inherit lib; }) cleanSourceWith;
 
+  # Normalize a relative path:
+  #  "."            -> ""
+  #  "./."          -> ""
+  #  "./xyz"        -> "xyz"
+  #  "../abc"       -> ERROR
+  #  "abc/.."       -> ""
+  #  "abc/../xyz"   -> "xyz"
+  #  "abc/./xyz"    -> "abc/xyz"
+  #  "abc/./../xyz" -> "xyz"
+  #  "abc/.././xyz" -> "xyz"
+  #  "abc/"         -> "abc/"
+  normalizeRelativePath = path:
+    let
+      # Remove a directory for each .. part of a path.
+      removeDotDots = parts: lib.reverseList (
+        builtins.foldl' (a: b:
+          if b == ".."
+            then builtins.tail a
+            else builtins.concatLists [ [b] a ]) [] parts);
+      # Split the path into component parts and remove the empty ones and single dots.
+      nonEmptyParts = lib.filter (x: x != "" && x != ".") (lib.splitString "/" path);
+    in lib.concatStringsSep "/" (removeDotDots nonEmptyParts)
+      # Keep the trailing slash if there was one.
+      + (if lib.hasSuffix "/" path then "/" else "");
+
+  # Is `path` a YAML file that an hpack `package.yaml` in the directory
+  # `pkgDir` might include from outside that directory?  Matches files in
+  # `pkgDir`'s ancestor directories (for instance a `../common.yaml` shared
+  # by several packages through `!include` or `defaults: local:`), except
+  # `package.yaml`, stack configuration (`stack.yaml`, `stack-ghc9.yaml`, ...)
+  # and hidden files (`.hlint.yaml` and the like), so that editing those does
+  # not rebuild every hpack package (#485).
+  isHpackAncestorInclude = pkgDir: path: type:
+    let name = baseNameOf path;
+    in type != "directory"
+      && builtins.match ".*\\.ya?ml" name != null
+      && name != "package.yaml"
+      && builtins.match "stack([-.].*)?\\.ya?ml" name == null
+      && !lib.hasPrefix "." name
+      && lib.hasPrefix (dirOf path + "/") (pkgDir + "/");
+
   # Use cleanSourceWith to filter just the files needed for a particular
   # component of a package
-  cleanCabalComponent = import ./clean-cabal-component.nix { inherit lib cleanSourceWith; };
+  cleanCabalComponent = import ./clean-cabal-component.nix { inherit lib cleanSourceWith normalizeRelativePath isHpackAncestorInclude; };
 
   # Clean git directory based on `git ls-files --recurse-submodules`
   cleanGit = import ./clean-git.nix {
@@ -246,7 +313,97 @@ in {
   check = import ./check.nix {
     inherit stdenv lib haskellLib;
     inherit (pkgs) pkgsBuildBuild;
+    # Every check for a host matching `emulatorNativeBuilderCheck` is
+    # pinned -- see `overlays/haskell.nix`.
+    emulatorSystemFeatures = pkgs.haskell-nix.emulatorSystemFeatures or [];
+    emulatorNativeBuilderCheck = pkgs.haskell-nix.emulatorNativeBuilderCheck or (_: false);
   };
+
+  # The same pin for a hand-written derivation that runs a host-platform exe
+  # through its component's `testWrapper` itself, rather than via `check`
+  # (e.g. test/cabal-simple-prof's `run`).  Merge into its attrs.
+  emulatorRunAttrs =
+    let features = pkgs.haskell-nix.emulatorSystemFeatures or [];
+    in lib.optionalAttrs (features != []
+        && (pkgs.haskell-nix.emulatorNativeBuilderCheck or (_: false)) stdenv.hostPlatform) {
+      requiredSystemFeatures = features;
+    };
+
+  # Add bash, zsh and fish completion scripts to an exe component built with
+  # optparse-applicative: haskell.nix's counterpart of nixpkgs'
+  # `haskell.lib.compose.generateOptparseApplicativeCompletions`, and like it
+  # installed with `installShellCompletion`.  The
+  # `generateOptparseApplicativeCompletions` component option applies it to
+  # `hsPkgs.<pkg>.components.exes.<exe>` itself.
+  #
+  # The scripts are made by a separate derivation that links to `drv`'s
+  # output, so the exe is not rebuilt and this works the same for both
+  # builders.  Every top-level entry of `drv` except `share` is one symlink
+  # (a v2 slice's `store/` stays a single link, and composing the result as
+  # a slice still finds it).  It keeps `drv`'s passthru (with `exePath`
+  # pointing into the new output, and `withoutCompletions` giving back
+  # `drv`); `override` and v1's `profiled`/`dwarf` give results with
+  # completions too, `overrideAttrs` changes only this derivation.
+  #
+  # The exe has to run on the build machine: natively, or through the
+  # component's emulator (`testWrapper`) when cross compiling.  When neither
+  # is possible (and for Windows, JavaScript and WebAssembly hosts, which have
+  # no use for shell completions) `drv` is returned as it is.
+  addOptparseApplicativeCompletions = drv:
+    let
+      inherit (drv) exeName;
+      inherit (stdenv) hostPlatform;
+      native = stdenv.buildPlatform.canExecute hostPlatform;
+      testWrapper = drv.config.testWrapper or [];
+      emulated = !native && testWrapper != []
+        && !(hostPlatform.isWindows || hostPlatform.isGhcjs || hostPlatform.isWasm);
+      # `timeout`: an exe that does not use optparse-applicative may ignore
+      # the flag and keep running (a server, say).
+      run = flag: lib.concatStringsSep " " (
+        [ "timeout" "300" ] ++ lib.optionals emulated testWrapper
+        ++ [ ''"$exe"'' flag ''"$exe"'' "< /dev/null" ]);
+      isV1 = !(drv.passthru.isSlice or false);
+      withCompletions = pkgs.buildPackages.runCommand drv.name
+        (haskellLib.emulatorRunAttrs // {
+          nativeBuildInputs = [
+            (pkgs.buildPackages.lndir or pkgs.buildPackages.xorg.lndir)
+            pkgs.buildPackages.installShellFiles
+          ];
+          passthru = (drv.passthru or {}) // {
+            exePath = withCompletions + "/bin/${exeName}";
+            withoutCompletions = drv;
+          } // lib.optionalAttrs isV1 (
+            lib.mapAttrs (_: haskellLib.addOptparseApplicativeCompletions)
+              (lib.filterAttrs (n: _: lib.elem n [ "profiled" "dwarf" ]) (drv.passthru or {})));
+          # `drv`'s `platforms` name its host, which is not where this runs.
+          meta = removeAttrs (drv.meta or {}) [ "platforms" "badPlatforms" ];
+        }) ''
+          mkdir -p $out/share
+          for e in ${drv}/* ${drv}/.[!.]*; do
+            [ -e "$e" ] || [ -L "$e" ] || continue
+            [ "$(basename "$e")" = share ] || ln -s "$e" $out/
+          done
+          if [ -d ${drv}/share ]; then
+            lndir -silent ${drv}/share $out/share
+          fi
+          exe=$out/bin/${exeName}
+          ${run "--bash-completion-script"} > ${exeName}.bash
+          ${run "--zsh-completion-script"} > ${exeName}.zsh
+          ${run "--fish-completion-script"} > ${exeName}.fish
+          # optparse-applicative's bash script ends `complete ... <exe>`.
+          grep -qE '^complete .* ${lib.escapeRegex exeName}$' ${exeName}.bash || {
+            echo "${exeName} --bash-completion-script did not print a completion script (does it use optparse-applicative?)" >&2
+            exit 1
+          }
+          installShellCompletion --cmd ${exeName} \
+            --bash ${exeName}.bash --zsh ${exeName}.zsh --fish ${exeName}.fish
+        '';
+      result = withCompletions
+        // lib.optionalAttrs (drv ? store) { inherit (drv) store; }
+        // lib.optionalAttrs (drv ? override) {
+          override = args: haskellLib.addOptparseApplicativeCompletions (drv.override args);
+        };
+    in if native || emulated then result else drv;
 
   # Do coverage of a package
   coverageReport = import ./cover.nix {
@@ -268,8 +425,12 @@ in {
   # This is the same as isCrossHost but for use when building ghc itself
   isCrossTarget = stdenv.targetPlatform != stdenv.hostPlatform
     && !(stdenv.hostPlatform.isLinux && stdenv.targetPlatform.isMusl && stdenv.hostPlatform.linuxArch == stdenv.targetPlatform.linuxArch);
-  # Native musl build-host-target combo
-  isNativeMusl = stdenv.targetPlatform.isMusl
+  # Native musl build-host-target combo.  The build platform must be
+  # Linux: `linuxArch` is defined for any OS (aarch64-darwin is "arm64"
+  # too), but a darwin build machine cannot run the musl binaries, so
+  # same-arch darwin->linux-musl is a real cross compile, not native.
+  isNativeMusl = stdenv.buildPlatform.isLinux
+    && stdenv.targetPlatform.isMusl
     && stdenv.buildPlatform.linuxArch == stdenv.hostPlatform.linuxArch
     && stdenv.hostPlatform.linuxArch == stdenv.targetPlatform.linuxArch;
 
@@ -294,6 +455,68 @@ in {
 
 
   cabalToNixpkgsLicense = import ./spdx/cabal.nix pkgs;
+
+  # Every direct Hackage tarball URL — of the form
+  #   https://hackage.haskell.org/package/NAME-VER/NAME-VER.tar.gz
+  # — occurring in `text`, parsed to `{ url; name; version; }` (unique, in
+  # first-seen order).  Shared by `modules/replace-hackage-tarball-urls.nix`
+  # (URL rewrite + build `src` overrides) and the stable-haskell overlay's
+  # boot-package dump synthesis, which both need the same (name, version) set.
+  hackageTarballUrls = text:
+    let
+      urlRe = "https://hackage[.]haskell[.]org/package/[^/[:space:]]+/[^/[:space:]]+[.]tar[.]gz";
+      urls = lib.unique (builtins.concatMap
+        (x: if builtins.isList x then x else [])
+        (builtins.split "(${urlRe})" text));
+    in map (url:
+         let m = builtins.match
+           "https://hackage[.]haskell[.]org/package/[^/]+/(.+)-([0-9][0-9.]*)[.]tar[.]gz" url;
+         in { inherit url; name = builtins.elemAt m 0; version = builtins.elemAt m 1; })
+       urls;
+
+  # The stable-haskell fork stage a plan.json unit belongs to ("build" =
+  # runs on the build machine: setup scopes, build tools; "host" = the
+  # artifacts' platform).  make-install-plan strips the fork's
+  # `host:`/`build:` id qualifiers (haskell.nix keys everything by the
+  # bare id), which loses the stage as an explicit field — but it
+  # survives in two places on configured units:
+  #   * the staged `--prefix=./dist-newstyle/store/<stage>/<platform>`
+  #     configure-arg (every configured unit);
+  #   * the `dist-dir` (`./dist-newstyle/build/<stage>/<platform>/...`,
+  #     local/inplace units only).
+  # Both are relative to where plan-to-nix ran, so for a project in a
+  # subdirectory they carry it first (`./test/cabal-22/dist-newstyle/...`,
+  # every test project); match any leading path.  Anchoring on
+  # `./dist-newstyle` sent every unit of such a plan to "host", which merged
+  # the two stages' configure-args in the slice project and let a Host
+  # `shared: True` reach the Build-stage tools.
+  # Pre-existing units carry neither; callers treat them per context
+  # (in a two-stage plan they are all build-stage — the target db is
+  # empty).  Defaults to "host": mainline plans are single-stage.
+  # The explicit `stage` (stable-haskell/merge cabal, nix-tools-sh's
+  # make-install-plan) or `machine` (haskell/cabal#12356) field wins: the
+  # 3.19 merge plans carry neither marker below, which put every unit in
+  # "host" and let a BUILD twin own a shared id first-wins (aarch64
+  # `resourcet` composed the native `primitive`).  Same order as
+  # comp-v2-builder's `planStage`.
+  planUnitStage = p:
+    let
+      fromField =
+        let s = p.stage or p.machine or null;
+        in if s == "host" || s == "build" then s else null;
+      fromArgs =
+        let ms = builtins.concatMap (a:
+              let m = builtins.match "--prefix=(.*/)?dist-newstyle/store/([a-z]+)/.*" (toString a);
+              in if m == null then [] else [ (builtins.elemAt m 1) ])
+              (p.configure-args or []);
+        in if ms == [] then null else builtins.head ms;
+      fromDist =
+        let m = builtins.match "(.*/)?dist-newstyle/build/([a-z]+)/.*" (p.dist-dir or "");
+        in if m == null then null else builtins.elemAt m 1;
+    in if fromField != null then fromField
+       else if fromArgs != null then fromArgs
+       else if fromDist != null then fromDist
+       else "host";
 
   # This function is like
   #   `src + (if subDir == "" then "" else "/" + subDir)`
@@ -333,8 +556,8 @@ in {
   # the a projectType module (../modules/cabal-project.nix or ../modules/stack-project.nix).
   # The resulting config is then passed to the project function's implementation.
   evalProjectModule = projectType: m: f:
-    let project = f
-      (lib.evalModules {
+    let
+      evaluated = lib.evalModules {
         modules = (if builtins.isList m then m else [m]) ++ [
           # Include ../modules/cabal-project.nix or ../modules/stack-project.nix
           (import ../modules/project-common.nix)
@@ -349,26 +572,49 @@ in {
             inherit (project) hsPkgs;
           })
         ];
-      });
-    in project;
+      };
+      project = f evaluated;
+    in import ./check-org-move.nix { inherit lib; } {
+      inherit (evaluated.config) src;
+      silence = evaluated.config.silenceOrgMoveWarning;
+    } project;
 
   # Converts from a `compoent.depends` value to a library derivation.
   # In the case of sublibs the `depends` value should already be the derivation.
   dependToLib = d:
     # Do not simplify this to `d.components.library or d`, as that
-    # will not give a good error message if the `.library`
-    # is missing (happens if the package is unplanned,
-    # but has overrides).
-    # It would be nice to put an `assert` here, but there is
-    # currently no good way to get the name of the dependency
-    # when it is not in the plan.  The attribute path of
-    # `d` in the `nix` error should include the name
-    # eg. `packages.Cabal.components.library`.
+    # would silently drop the dependency when `.library` is missing
+    # (which happens when the package is unplanned but has overrides).
+    # A package value carries its `identifier` (see hspkg-builder.nix), so
+    # when the library component is absent we can throw a message naming the
+    # dependency instead of the opaque `attribute 'library' missing` error
+    # (see #1379).  Checking `d.components ? library` adds no strictness: the
+    # non-error path already forces `d.components` to read `.library`.
     if d ? components
-    then if d ? instantiations
-         then d.components.library.override { inherit (d) instantiations; }
-         else d.components.library
+    then if d.components ? library
+         then if d ? instantiations
+              then d.components.library.override { inherit (d) instantiations; }
+              else d.components.library
+         else throw (unplannedLibraryMessage (d.identifier.name or null))
     else d;
+
+  # The error for a dependency whose package has no library component (#1379).
+  # `applyComponents` omits the library when the package is not in the plan,
+  # but also when it is not buildable or not individually planned, so the
+  # message lists every cause.  Shared by `dependToLib` (v1) and the v2
+  # builder's dependency-slice lookup.
+  unplannedLibraryMessage = name:
+    let pkg = if name == null then "<name>" else name;
+    in "haskell.nix: the library of package '${if name == null then "<unknown>" else name}'"
+      + " is not available. Either the package has no library at all (for"
+      + " example it only has executables), it is not in the install plan"
+      + " (often because it was given overrides via `modules` /"
+      + " `packages.${pkg}` without being a dependency of the project),"
+      + " its library is not buildable (`packages.${pkg}.package.buildable`"
+      + " or `buildable: False` in the .cabal file), or the library was not"
+      + " planned (`packages.${pkg}.components.library.planned` is false)."
+      + " Make sure the project depends on it and that its library is"
+      + " buildable, or remove the override.";
 
   projectOverlays = import ./project-overlays.nix {
     inherit lib haskellLib;
@@ -467,6 +713,33 @@ in {
           package)
       { };
 
+  # Flake haddock documentation, keyed by component name like `mkFlakePackages`.
+  # Only library/test components with `doHaddock` enabled expose a `doc` output
+  # (see `builder/comp-builder.nix`), so guarding on `component ? doc` selects
+  # exactly those and skips exes, benchmarks and haddock-disabled components —
+  # no null or broken jobs (see #1932).  v2 slices (`builderVersion = 2`)
+  # differ: every library has a `doc` attr, which throws unless the plan built
+  # it with documentation, and `docEnabled` says which.
+  mkFlakeHaddock =
+    foldrAttrVals
+      (package: acc:
+        foldComponents
+          subComponentTypes
+          (component: a:
+            if component ? doc && (component.docEnabled or true)
+              then a // { ${component.passthru.identifier.component-id} = component.doc; }
+              else a)
+          acc
+          package)
+      { };
+
+  # A flake `apps` entry that runs an executable component.
+  mkFlakeApp = component: {
+    type = "app";
+    program = component.exePath;
+    inherit (component) meta;
+  };
+
   # Flake package names that are flat and match the cabal component names.
   mkFlakeApps =
     foldrAttrVals
@@ -474,15 +747,54 @@ in {
         foldComponents
           [ "exes" "tests" "benchmarks" ]
           (component: a: a // {
-            ${component.passthru.identifier.component-id} = {
-              type = "app";
-              program = component.exePath;
-              inherit (component) meta;
-            };
+            ${component.passthru.identifier.component-id} = mkFlakeApp component;
           })
           acc
           package)
       { };
+
+  # The packages in `haskellPackages` whose source is the project directory
+  # itself (the one holding `cabal.project` or `stack.yaml`), as opposed to
+  # a subdirectory of it.  Those are what a bare `cabal build` or
+  # `cabal run` acts on when run in the project directory.
+  # Project package sources are made with `appendSubDir` from the project
+  # `src`, so they keep its `origSrc` and add their own path to
+  # `origSubDir`; comparing the two finds them without reading any files.
+  projectRootPackages = projectSrc: haskellPackages:
+    let
+      srcDir = src: toString (src.origSrc or src) + (src.origSubDir or "");
+      rootDir = srcDir projectSrc;
+    in lib.filterAttrs (_: p: (p.src or null) != null && srcDir p.src == rootDir)
+      haskellPackages;
+
+  # The components to use for the flake's `packages.default` and
+  # `apps.default`.  Like bare `cabal build` and `cabal run`, they come from
+  # the package in the project directory, and only when there is exactly
+  # one.  `app` is that package's executable, when it has exactly one.
+  # `package` is that same executable, or else the package's library (a
+  # flake package is a single component, while `cabal build` builds all of
+  # the package's).  Each is `null` when there is no single obvious choice.
+  defaultFlakeComponents = projectSrc: haskellPackages:
+    let
+      roots = lib.optionals (projectSrc != null)
+        (lib.attrValues (projectRootPackages projectSrc haskellPackages));
+      # `hsPkgs` from a `plan.json` has an entry per unit, each holding just
+      # that unit's components (the library in one, each executable in
+      # another), so gather them up by package name.  The executables are
+      # listed, not merged by name: two entries holding the same one (with
+      # a custom `selectPackages`) mean there is no single choice.
+      names = lib.unique (map (p: p.identifier.name) roots);
+      exes = lib.concatMap (p: lib.attrValues (p.components.exes or {})) roots;
+      libs = lib.filter (l: l != null) (map (p: p.components.library or null) roots);
+      exe = if lib.length exes == 1 then lib.head exes else null;
+    in if lib.length names != 1
+      then { package = null; app = null; }
+      else {
+        app = exe;
+        package = if exe != null then exe
+          else if libs != [] then lib.head libs
+          else null;
+      };
 
   # Flatten the result of collectChecks or collectChecks' for use in flake `checks`
   mkFlakeChecks = allChecks:
@@ -510,6 +822,7 @@ in {
         , coverage
         , devShells
         , checkedProject
+        , haddock ? {}
     }: {
       # Run all the tests and code coverage
       checks = removeRecurseForDerivations checks;
@@ -521,6 +834,11 @@ in {
         devShells;
       # Build tools and cache tools needed for the project
       inherit (project) roots;
+    }
+    # Make sure the haddock documentation builds (only when requested, so
+    # projects that do not opt in keep exactly the same jobs)
+    // lib.optionalAttrs (haddock != {}) {
+      inherit haddock;
     }
     # Build the plan-nix and check it if materialized
     // lib.optionalAttrs (checkedProject ? plan-nix) {
@@ -538,25 +856,45 @@ in {
         , apps ? mkFlakeApps haskellPackages
         , checks ? mkFlakeChecks (collectChecks' haskellPackages)
         , coverage ? {}
+        # Set `doHaddock = true` to also build the haddock documentation of the
+        # project components in CI so broken docs are caught (#1932).
+        , doHaddock ? false
+        , haddock ? lib.optionalAttrs doHaddock (mkFlakeHaddock haskellPackages)
         , devShell ? project.shell
         , devShells ? { default = devShell; }
         , checkedProject ? project.appendModule { checkMaterialization = true; }
-        , ciJobs ? mkFlakeCiJobs project { inherit checks coverage packages devShells checkedProject; }
+        , ciJobs ? mkFlakeCiJobs project { inherit checks coverage packages haddock devShells checkedProject; }
         , hydraJobs ? ciJobs
+        # The component for `packages.default` (`nix build`) and
+        # `apps.default` (`nix run`).  By default these come from the
+        # package in the project directory (see `defaultFlakeComponents`);
+        # pass `null` to leave either out, or `doDefaults = false` for both.
+        # A `default` already in `packages` or `apps` is kept.
+        , doDefaults ? true
+        , defaultComponents ?
+            if doDefaults
+              then defaultFlakeComponents (project.args.src or null) haskellPackages
+              else { package = null; app = null; }
+        , defaultPackage ? defaultComponents.package
+        , defaultApp ? defaultComponents.app
       }: {
-      inherit
           # Used by:
           #   `nix build .#pkg-name:lib:pkg-name`
           #   `nix build .#pkg-name:lib:sublib-name`
           #   `nix build .#pkg-name:exe:exe-name`
           #   `nix build .#pkg-name:test:test-name`
-          packages
+          #   `nix build`
+          packages = lib.optionalAttrs (defaultPackage != null) { default = defaultPackage; }
+            // packages;
+          #   `nix run .#pkg-name:exe:exe-name`
+          #   `nix run .#pkg-name:test:test-name`
+          #   `nix run`
+          apps = lib.optionalAttrs (defaultApp != null) { default = mkFlakeApp defaultApp; }
+            // apps;
+      inherit
           # Used by:
           #   `nix flake check`
           checks
-          #   `nix run .#pkg-name:exe:exe-name`
-          #   `nix run .#pkg-name:test:test-name`
-          apps
           # Used by hydra.
           hydraJobs
           # Like `hydraJobs` but with `${system}` first so that it the IFDs will not have
@@ -610,6 +948,8 @@ in {
     then "aarch64"
     else if hostPlatform.isi686
     then "i386"
+    else if hostPlatform.isx86_64
+    then "x86_64"
     else abort "Don't know which QEMU to use for hostPlatform ${hostPlatform.config}. Please provide qemuSuffix";
 
   # How to run ldd when checking for static linking
@@ -660,9 +1000,8 @@ in {
   # almost never reflects intent.
   # Warns (but passes) when items share a key but differ structurally --
   # typically a list-merge accident where an explicit override appended to
-  # a default rather than replacing it (use `lib.mkForce`).  Master's
-  # `checkUnique` allowed this silently; bd93f01d3 unintentionally tightened
-  # it to an error; we keep master's tolerance but flag it for visibility.
+  # a default rather than replacing it (use `lib.mkForce`).  That case
+  # used to pass silently; it stays allowed, but is flagged for visibility.
   checkUnique = msg: x:
     let
       grouped = builtins.groupBy uniqueWithNameKey x;
@@ -688,4 +1027,15 @@ in {
   types = import ./types.nix { inherit lib; };
 
   addPackageKeys = x: x // { package-keys = builtins.attrNames x.packages; };
+
+  # `builtins.toFile` refuses text that references a derivation output
+  # (e.g. `configureOptions = [ "--with-foo=${pkgs.foo}" ]` or a darwin
+  # framework's `extra-lib-dirs:`).  Keep `toFile` for the usual
+  # context-free text (no extra drv, unchanged hashes) and fall back to
+  # `writeText` when the text carries derivation context.
+  textFile = name: text:
+    if lib.any (c: c ? outputs || (c.allOutputs or false))
+         (lib.attrValues (builtins.getContext text))
+    then pkgs.writeText name text
+    else builtins.toFile name text;
 }

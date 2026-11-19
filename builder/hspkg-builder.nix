@@ -97,14 +97,41 @@ let
           let
             plan     = config.plan-json.install-plan;
             byId     = config.plan-json-by-id;
-            sibs     = lib.filter
+            # HOST-stage entries only: the fork's build twins share the
+            # bare id/name/version but carry the BUILD-stage dep set
+            # (setup universes), which must not union into the host
+            # slices' dep/constraint scopes.  Falls back to every entry
+            # for build-stage-only packages (their slices still build,
+            # natively with the same compiler).
+            sibsOf = stagePred: lib.filter
               (p: (p.pkg-name or null) == package.identifier.name
-                  && (p.pkg-version or null) == package.identifier.version)
+                  && (p.pkg-version or null) == package.identifier.version
+                  && stagePred p)
               plan;
+            # Siblings at THIS unit's stage: a build-machine twin
+            # (`<id>:build`, lib/load-cabal-plan.nix) takes its build
+            # siblings' deps, never the host ones (which would put host
+            # slices in a build-machine slice's closure).
+            ownEntry = byId.${package.identifier.unit-id or ""} or null;
+            ownStage = if ownEntry == null then "host"
+                       else pkgs.haskell-nix.haskellLib.planUnitStage ownEntry;
+            stageSibs = sibsOf (p: pkgs.haskell-nix.haskellLib.planUnitStage p == ownStage);
+            sibs = if stageSibs != [] then stageSibs else sibsOf (_: true);
+            # NOT the `setup` component: setup deps are a separate
+            # solver universe (`<pkg>:setup.<dep>` qualifiers,
+            # BUILD-stage under the fork).  Folding them in here sends
+            # them through `homeLibDepSlices` into `dependsSlices` —
+            # the lib-scope CONSTRAINTS — where their version pins
+            # clash with the library closure (leksah: gi-gobject's
+            # setup wants haskell-gi-overloading 1.0 while its lib
+            # closure needs 0.0; the `==1.0` pin made the lib goal
+            # unsatisfiable).  Setup deps reach the slice through
+            # `setupDepSlices` (store + repo, no constraints) and the
+            # per-package `<pkg>:setup.<dep> ==<ver>` pins instead.
             libDepsOf = p:
               (p.depends or [])
               ++ lib.concatMap (c: c.depends or [])
-                   (lib.attrValues (p.components or {}));
+                   (lib.attrValues (builtins.removeAttrs (p.components or {}) ["setup"]));
             exeDepsOf = p:
               (p.exe-depends or [])
               ++ lib.concatMap (c: c.exe-depends or [])
@@ -115,20 +142,26 @@ let
               let q = byId.${id} or null;
               in if q == null
                  then null
-                 else { name = q.pkg-name; version = q.pkg-version; };
+                 else { name = q.pkg-name; version = q.pkg-version; inherit id; };
             # Boot packages (base, ghc-prim, rts, ...) don't have
             # slicable haskell.nix builds — they come with GHC and
             # are already registered in the starting package db.
             # `pre-existing` in plan-json flags these; skip them.
-            preExisting = lib.filter
-              (p: (p.type or null) == "pre-existing")
-              plan;
-            preExistingNames = map (p: p.pkg-name) preExisting;
-            isExcluded = nv:
-              nv == null
-              || nv.name == package.identifier.name
-              || lib.elem nv.name preExistingNames;
-            filterIds = ids: lib.filter (nv: !(isExcluded nv)) (map idToNV ids);
+            # Exclude by the referenced UNIT's type, not by name: under
+            # stable-haskell a boot library can exist BOTH pre-existing
+            # (the compiler's db) and reinstalled `configured inplace`
+            # (parsec on the musl cross), and a sibling dep edge that
+            # points at the reinstalled twin must still reach the slice
+            # — a name-based skip drops it and the slice's solver then
+            # finds no parsec at all.
+            isExcludedId = id:
+              let q = byId.${id} or null;
+              in q == null
+                 || (q.pkg-name or null) == package.identifier.name
+                 || (q.type or null) == "pre-existing";
+            filterIds = ids:
+              lib.filter (nv: nv != null)
+                (map idToNV (lib.filter (id: !(isExcludedId id)) ids));
           in {
             homeDependIds    = filterIds libIds;
             homeBuildToolIds = filterIds exeIds;
@@ -137,6 +170,10 @@ let
           inherit componentId component package name src flags patches cabalFile cabal-generator;
           inherit (pkg) prePatch postPatch;
           inherit (homeIds) homeDependIds homeBuildToolIds;
+          # Boot packages the compiler provides — comp-v2-builder keeps these
+          # out of two-stage build-tool source staging (they have no real
+          # hackage src, so staging them would coerce a null fetchurl hash).
+          inherit (config) nonReinstallablePkgs;
           pkgSet = config.packages;
           packageIdsByName = config.package-ids-by-name;
           # Raw plan.json `install-plan` array — comp-v2-builder
@@ -149,6 +186,9 @@ let
           # and shared across all slices so the v2 builder doesn't
           # rebuild the same N-entry attrset per component.
           planJsonByPlanId = config.plan-json-by-id;
+          # The BUILD-twin-preferring variant, for the custom-setup
+          # machinery (setup scopes are build-stage under the fork).
+          planJsonByPlanIdBuild = config.plan-json-by-id-build;
           # Project-global pragma / doc / flag data, computed once from
           # the plan (see `builder/v2-project-globals.nix`) and shared
           # across every slice instead of recomputed per component.
@@ -178,11 +218,89 @@ let
                 in q != null && q.pkg-name == package.identifier.name;
             in lib.any (p: lib.any isSelfId (exeDepsOf p)) sibs;
         };
-    # `builderVersion` (propagated from the project-level option)
-    # picks the derivation at `hsPkgs.<pkg>.components.<kind>.<n>`.
-    # Switch builders by setting the project-level `builderVersion`
-    # option (1 or 2) — there's no per-component opt-in / opt-out.
-    in if builderVersion == 2 then v2 else v1;
+        # `builderVersion` (propagated from the project-level option)
+        # picks the derivation at `hsPkgs.<pkg>.components.<kind>.<n>`.
+        # Switch builders by setting the project-level `builderVersion`
+        # option (1 or 2) — there's no per-component opt-in / opt-out.
+        drv = if builderVersion == 2 then v2 else v1;
+    in if haskellLib.isExe componentId && (component.generateOptparseApplicativeCompletions or false)
+      then haskellLib.addOptparseApplicativeCompletions drv
+      else drv;
+
+  # The source distribution `cabal sdist` would make for this package.
+  # It needs no compiler and no dependencies: the prebuilt `cabal` from
+  # nix-tools only reads the .cabal file and packs the files it lists, so
+  # a file missing from `extra-source-files` (or similar) fails here
+  # rather than after an upload to Hackage.  The .cabal file is the one
+  # the builders use (a Hackage revision, or the hpack output for a
+  # package.yaml); haskell.nix `patches` and hooks are not applied.
+  # Built on the build platform, as the tarball does not depend on the
+  # host.
+  #
+  # `cabal` is the one the project plans with by default: the
+  # stable-haskell fork for v2 projects and stable-haskell compilers
+  # (see modules/cabal-project.nix), mainline otherwise.  `hpack` always
+  # comes from the mainline tools, as in both builders, so the .cabal
+  # file matches the one the components are built from.
+  sdistTools =
+    if builderVersion == 2 || (ghc.isStableHaskell or false)
+      then buildPackages.haskell-nix.nix-tools-unchecked-sh
+      else buildPackages.haskell-nix.nix-tools-unchecked;
+  # `cabal sdist` names the tarball from the .cabal file's name and version.
+  sdistName = "${package.identifier.name}-${package.identifier.version}";
+  sdist = buildPackages.stdenvNoCC.mkDerivation {
+    name = "${sdistName}-sdist";
+    inherit src cabalFile;
+    passAsFile = [ "cabalFile" ];
+    dontConfigure = true;
+    # A local package's `src` is its own directory in the store, so a
+    # relative symlink in it (`specifications -> ../../specifications`)
+    # does not resolve once copied into the build directory.  Replace each
+    # symlink whose target exists in the store copy with that target, as
+    # `cp -L` does for the v2 builder's package tarball.  Dangling links
+    # are left alone; `cabal sdist` only fails on them if the .cabal file
+    # lists them.
+    postUnpack = ''
+      if [ -d "$src" ]; then
+        (cd "$src" && find . -type l) | while IFS= read -r l; do
+          if [ -e "$src/$l" ]; then
+            rm "$sourceRoot/$l"
+            cp -rL --no-preserve=mode "$src/$l" "$sourceRoot/$l"
+          fi
+        done
+      fi
+    '';
+    # A Hackage revision replaces the package's .cabal file, which may
+    # have a different file name.  The builders read the .cabal file
+    # haskell.nix generates, and `cabal sdist` is given a project file of
+    # its own so that a cabal.project in the package directory (which may
+    # list packages not in `src`) is not read.
+    buildPhase = ''
+      runHook preBuild
+      ${if cabalFile != null
+        then ''
+          rm -f ./*.cabal
+          cp $cabalFilePath ${package.identifier.name}.cabal
+        ''
+        else lib.optionalString (cabal-generator == "hpack") ''
+          ${buildPackages.haskell-nix.nix-tools-unchecked}/bin/hpack
+        ''}
+      echo 'packages: .' > .haskell-nix-sdist.project
+      export HOME=$TMPDIR
+      ${sdistTools}/bin/cabal sdist \
+        --project-file=.haskell-nix-sdist.project \
+        --output-directory=$TMPDIR/sdist
+      runHook postBuild
+    '';
+    installPhase = ''
+      runHook preInstall
+      mkdir -p $out/nix-support
+      cp $TMPDIR/sdist/${sdistName}.tar.gz $out/
+      echo "file source-dist $out/${sdistName}.tar.gz" >> $out/nix-support/hydra-build-products
+      runHook postInstall
+    '';
+    passthru.tarball = "${sdist}/${sdistName}.tar.gz";
+  };
 
 in rec {
   components = haskellLib.applyComponents (buildComp pkg.allComponent) pkg;
@@ -190,7 +308,7 @@ in rec {
     (_: d: haskellLib.check d)
       (lib.filterAttrs (_: d: d.config.doCheck) components.tests));
   inherit (package) identifier detailLevel isLocal isProject buildType;
-  inherit setup;
+  inherit setup sdist;
   isHaskell = true;
   inherit src;
 }

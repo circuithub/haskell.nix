@@ -73,6 +73,25 @@ components = {
 }
 ```
 
+A package also has an `sdist` attribute: the source distribution
+tarball `cabal sdist` makes for it, built with no compiler and no
+dependencies.  `sdist.tarball` is the path of the `.tar.gz` file, and
+Hydra lists it as a build product.  It fails to build if the `.cabal`
+file names a file (for example in `extra-source-files`) that is not in
+the package source, so checking it in CI catches that before an upload
+to Hackage.
+
+```nix
+project.hsPkgs.my-package.sdist          # directory holding my-package-1.0.tar.gz
+project.hsPkgs.my-package.sdist.tarball  # the .tar.gz itself
+```
+
+It uses the `.cabal` file that `components` are built from (a Hackage
+revision, or the file hpack generates from `package.yaml`) but not the
+`patches` or hooks set for the package.  Symlinks in the package
+directory that point outside it (such as `LICENSE -> ../LICENSE`) are
+packed as the files they point to.
+
 ## Component
 
 In [Haskell.nix][], a _component_ is a derivation corresponding to a
@@ -109,6 +128,44 @@ will be passed to it:
 | `config` | | |
 | `options` | | |
 
+### Options for all local or project packages
+
+Options for a single package go under `packages.<name>`.  To set options
+for every package of the project without naming them, use
+`projectPackages` (packages with `package.isProject` set: the packages
+listed in the project itself) or `localPackages` (packages with
+`package.isLocal` set: those plus the ones from `source-repository-package`
+stanzas, or local and git `extra-deps` for stack).  Packages from Hackage
+are never affected.
+
+For example, to turn warnings into errors when the project is built by
+Nix, but not when `cabal` is used in a development shell:
+
+```nix
+project = pkgs.haskell-nix.cabalProject' {
+  # ...
+  modules = [{
+    projectPackages = { ghcOptions = [ "-Werror" ]; };
+    # Skip building the documentation of the project's own packages
+    # and of the `source-repository-package`s.
+    localPackages = { doHaddock = false; };
+  }];
+};
+```
+
+Each takes the same options as `packages.<name>` (including `components`),
+or a function of the package's module arguments returning them.  Several
+definitions (from different modules, or as a list) are merged as if each
+was given for every one of those packages.  The function must not decide
+*which* options to set from the package's own `config` (that leads to
+infinite recursion), but it may set options that merge with the package's
+other definitions, such as appending to `postUnpack`.
+
+With `builderVersion = 2` these behave exactly like the same options set
+under `packages.<name>`, so the limits described in
+[migrating to v2](../dev/migrating-to-v2.md) apply (for instance
+`ghcOptions` is per package, not per component).
+
 
 # Top-level attributes
 
@@ -130,6 +187,20 @@ pkgs.haskell-nix.project' {
 }
 ```
 
+**The `shell` argument**: `project'`, `cabalProject'` and `stackProject'`
+(and their unprimed versions) all accept a `shell` argument.  It takes
+the same options as [`shellFor`](#shellfor) (they are checked by
+`modules/shell.nix`), and the resulting shell is the project's `shell`
+attribute.  It is also the default `devShell` of the project's `flake`
+output.
+
+```nix
+(pkgs.haskell-nix.project' {
+  src = ./.;
+  shell.tools.cabal = {};
+}).shell
+```
+
 ## stackProject'
 
 A function calling [callStackToNix](#callstacktonix) with all arguments.
@@ -144,6 +215,7 @@ Then feeding its result into [mkStackPkgSet](#mkstackpkgset) passing also
 | `hsPkgs`          | Attrset of [Haskell Packages](#haskell-package)  | Buildable packages, created from `packages`                                |
 | `stack-nix`       |                                                  | `projectNix` attribute of [`callStackToNix`](#callstacktonix) return value |
 | `shellFor`        | Function                                         | [`shellFor`](#shellfor)                                                    |
+| `shell`           | Derivation                                       | Shell made with the project `shell` argument (see [`shellFor`](#shellfor)) |
 | `ghcWithHoogle`   | Function                                         | [`ghcWithHoogle`](#ghcwithhoogle)                                          |
 | `ghcWithPackages` | Function                                         | [`ghcWithPackages`](#ghcwithpackages)                                      |
 
@@ -163,6 +235,7 @@ Then feeding its result into [mkCabalProjectPkgSet](#mkcabalprojectpkgset) passi
 | `plan-nix`        |                                                  | `projectNix` attribute of [`callCabalProjectToNix`](#callcabalprojecttonix) return value  |
 | `index-state`     |                                                  | `index-state` attribute of [`callCabalProjectToNix`](#callcabalprojecttonix) return value |
 | `shellFor`        | Function                                         | [`shellFor`](#shellfor)                                                     |
+| `shell`           | Derivation                                       | Shell made with the project `shell` argument (see [`shellFor`](#shellfor))  |
 | `ghcWithHoogle`   | Function                                         | [`ghcWithHoogle`](#ghcwithhoogle)                                           |
 | `ghcWithPackages` | Function                                         | [`ghcWithPackages`](#ghcwithpackages)                                       |
 | `projectCross`    | Attrset                                          | Like `pkgs.pkgsCross.<system>` from nixpkgs `p.projectCross.<system>` returns the project results for cross compilation (where system is a member of nixpkgs lib.systems.examples).  So `p.projectCross.ghcjs.hsPkgs` is the same as `hsPkgs` but compiled with ghcjs |
@@ -384,7 +457,8 @@ to `tests.mypackage.unit-tests`.
 
 These are just like `collectComponents` and `collectComponents'`, except that they collect
 the `checks` attributes of packages (which aren't components, and so can't be collected
-by the other functions.
+by the other functions). Only tests with `doCheck` enabled have a check; see
+[Running tests](../tutorials/testing.md).
 
 #### check
 
@@ -395,7 +469,8 @@ This function turns a derivation that builds a test into one to run it.
 | `drv`           | Derivation | One of `$pkg.components.tests.$test`. |
 
 For convenience `$pkg.components.tests` are mapped with this function
-to `$pkg.checks`.
+to `$pkg.checks` (only the tests with `doCheck` enabled; see
+[Running tests](../tutorials/testing.md)).
 
 This function is intended for use with `tests` but it should also work
 for `exes` and `benchmarks` if you just want to run them to make sure
@@ -437,7 +512,7 @@ shellFor =
 | `withHoogle`   | Boolean  | Whether to build a Hoogle documentation index and provide the `hoogle` command. |
 | `exactDeps`    | Boolean  | Prevents the Cabal solver from choosing any package dependency other than what are in the package set. |
 | `allToolDeps`  | Boolean  | Indicates if the shell should include all the tool dependencies of the haskell packages in the project. |
-| `tools`        | Function | AttrSet of tools to make available e.g. `{ cabal = "3.2.0.0"; }` or `{ cabal = { version = "3.2.0.0"; }; }`. If an AttrSet is provided for a tool, the additional arguments will be passed to the function creating the derivation for that tool. So you can provide an `index-state` or a `materialized` argument like that `{ cabal = { version = "3.2.0.0"; index-state = "2020-10-30T00:00:00Z"; materialized = ./cabal.materialized; }; }` for example. You can specify and materialize the version of hoogle used to construct the hoogle index by including something like `{ hoogle = { version = "5.0.17.15"; index-state = "2020-05-31T00:00:00Z"; materialized = ./hoogle.materialized; }`. Uses a default version of hoogle if omitted. |
+| `tools`        | Function | AttrSet of tools to make available e.g. `{ cabal = "3.2.0.0"; }` or `{ cabal = { version = "3.2.0.0"; }; }`. If an AttrSet is provided for a tool, the additional arguments will be passed to the function creating the derivation for that tool. So you can provide an `index-state` or a `materialized` argument like that `{ cabal = { version = "3.2.0.0"; index-state = "2020-10-30T00:00:00Z"; materialized = ./cabal.materialized; }; }` for example. You can specify and materialize the version of hoogle used to construct the hoogle index by including something like `{ hoogle = { version = "5.0.17.15"; index-state = "2020-05-31T00:00:00Z"; materialized = ./hoogle.materialized; }`. Uses a default version of hoogle if omitted. See [Tools](tools.md) for the details. |
 | `packageSetupDeps` | Boolean | Set this to `false` to exclude custom-setup dependencies.
 | `enableDWARF`  | Boolean  | Include debug info |
 | `crossPlatforms` | Function | Platform selection function for cross compilation targets to support eg. `ps: with ps; [ghcjs mingwW64]` (see nixpkgs lib.systems.examples for list of platform names). |
@@ -466,24 +541,55 @@ or
 ```
 
 The `shellFor` arguments can also be passed to the project `shell`
-argument.  For instance:
+argument and the resulting shell used via the project's `shell`
+attribute.  For instance:
 
 ```
 (pkgs.haskell-nix.project {
   ...
-  shell.tools.cabal = {}
-).shellFor {}
+  shell.tools.cabal = {};
+}).shell
 ```
 
-Is the same as:
+Gives the same shell as:
 
 ```
 (pkgs.haskell-nix.project {
   ...
-).shellFor {
-  tools.cabal = {}
+}).shellFor {
+  tools.cabal = {};
 }
 ```
+
+The arguments passed to `shellFor` are merged with the project's
+`shell` argument rather than replacing it.  For instance, a
+project-level `shell.tools.cabal = {};` still applies when calling
+`shellFor { withHoogle = false; }`.
+
+> **Note:** Prefer the `shell` argument and `.shell` attribute.
+>
+> `shellFor` makes a new project (using [`appendModule`](#cabalproject'))
+> with the arguments added to `shell`, and returns that project's
+> `shell`.  The new project shares nothing with the original one, so
+> its package set, plan and components are all evaluated again.  Nix
+> does not memoize function calls either, so each `shellFor` call
+> repeats this work, even with identical arguments.  By contrast,
+> `project.shell` is an attribute of the project: it is evaluated
+> at most once and reuses the project's own evaluation.
+>
+> This only costs extra when the original project is evaluated too.
+> A `shell.nix` that does nothing but call `project.shellFor {...}`
+> evaluates about one project either way.  The cost shows up when the
+> same evaluation also uses other outputs of the project (for instance
+> a flake that exposes `hsPkgs` packages or checks and also builds its
+> dev shell with `shellFor`, or CI jobs that include both), or when
+> `shellFor` is called more than once on the same project.  For large
+> projects this can add significantly to evaluation time and memory
+> use.
+>
+> `crossPlatforms` has a similar cost even when using `.shell`: the
+> shell for each selected platform is made by calling `shellFor` on the
+> corresponding `projectCross` project.
 
 **Return value**: a derivation
 
@@ -518,4 +624,4 @@ The same as `ghcWithPackages`, except, a `hoogle` command with a
 Hoogle documentation index of the packages will be included in the
 shell.
 
-[haskell.nix]: https://github.com/input-output-hk/haskell.nix
+[haskell.nix]: https://github.com/ican-group/haskell.nix
