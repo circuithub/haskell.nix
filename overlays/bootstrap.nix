@@ -1265,6 +1265,49 @@ in {
 
                 ghc-patches = ghc-patches "9.12.4";
             });
+            ghc9125 = traceWarnOld "9.12" (final.callPackage ../compiler/ghc {
+                extra-passthru = { buildGHC = final.buildPackages.haskell-nix.compiler.ghc9125; };
+
+                bootPkgs = bootPkgsGhc94 // {
+                  ghc = if final.stdenv.buildPlatform != final.stdenv.targetPlatform
+                    then final.buildPackages.buildPackages.haskell-nix.compiler.ghc9125
+                    else final.buildPackages.buildPackages.haskell.compiler.ghc9125
+                          or final.buildPackages.buildPackages.haskell.compiler.ghc9123
+                          or final.buildPackages.buildPackages.haskell.compiler.ghc9122
+                          or final.buildPackages.buildPackages.haskell.compiler.ghc9121
+                          or final.buildPackages.buildPackages.haskell.compiler.ghc9101
+                          or final.buildPackages.buildPackages.haskell.compiler.ghc984
+                          or final.buildPackages.buildPackages.haskell.compiler.ghc983
+                          or final.buildPackages.buildPackages.haskell.compiler.ghc982
+                          or final.buildPackages.buildPackages.haskell.compiler.ghc981
+                          or final.buildPackages.buildPackages.haskell.compiler.ghc967
+                          or final.buildPackages.buildPackages.haskell.compiler.ghc966
+                          or final.buildPackages.buildPackages.haskell.compiler.ghc965
+                          or final.buildPackages.buildPackages.haskell.compiler.ghc964
+                          or final.buildPackages.buildPackages.haskell.compiler.ghc963
+                          or final.buildPackages.buildPackages.haskell.compiler.ghc962
+                          or final.buildPackages.buildPackages.haskell.compiler.ghc945
+                          or final.buildPackages.buildPackages.haskell.compiler.ghc944
+                          or final.buildPackages.buildPackages.haskell.compiler.ghc943;
+                };
+                inherit sphinx;
+
+                buildLlvmPackages = final.buildPackages.llvmPackages_19;
+                llvmPackages = final.llvmPackages_19;
+
+                src-spec.file = final.fetchFromGitLab {
+                  domain = "gitlab.haskell.org";
+                  owner = "ghc";
+                  repo = "ghc";
+                  rev = "087fbaa9bbbedc61b1a4100c7dba76328163a5ec";
+                  hash = "sha256-RM83qDLn/Iqay7Z4p881uXEmi7sCl2J3wc4+jj+6Kw0=";
+                  fetchSubmodules = true;
+                };
+                src-spec.version = "9.12.4.20261019";
+                src-spec.needsBooting = true;
+
+                ghc-patches = ghc-patches "9.12.5";
+            });
             ghc9141 = traceWarnOld "9.14" (final.callPackage ../compiler/ghc {
                 extra-passthru = { buildGHC = final.buildPackages.haskell-nix.compiler.ghc9141; };
 
