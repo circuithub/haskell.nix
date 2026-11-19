@@ -243,7 +243,7 @@ let
   # job count (e.g. `buildJobs = 1` for a sequential, low-memory build).
   buildJobsFlag =
     if buildJobs == null
-      then "-j$(($NIX_BUILD_CORES > 4 ? 4 : $NIX_BUILD_CORES))"
+      then "-j$NIX_BUILD_CORES"
       else lib.head buildJobsFlags;
 
   # Ignore attempts to include DWARF info when it is not possible
